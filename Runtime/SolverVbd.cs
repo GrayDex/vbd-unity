@@ -30,6 +30,7 @@ namespace Vbd
             CreateContacts();
             CreateRigidBodies();
             CreateBodyContacts();
+            CreateBodyBodyContacts();
         }
 
         partial void CreateRigidBodies();
@@ -44,6 +45,7 @@ namespace Vbd
         // `contacts` from CollisionPipeline.Collide on the same state, or null for none.
         public void Step(CommandBuffer cmd, State state, Contacts contacts, float dt)
         {
+            InitializeBodyBodyContacts(cmd, state, contacts, dt);
             InitializeRigidBodies(cmd, state, dt);
             InitializeParticles(cmd, state, dt);
             InitializeContacts(cmd, state, contacts);
@@ -51,6 +53,7 @@ namespace Vbd
             for (var iter = 0; iter < Iterations; iter++)
             {
                 SolveRigidBodyIteration(cmd, state, contacts, dt);
+                UpdateBodyBodyContactDuals(cmd, contacts);
                 SolveParticleIteration(cmd);
             }
             FinalizeRigidBodies(cmd, state, dt);
