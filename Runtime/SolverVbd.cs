@@ -32,7 +32,9 @@ namespace Vbd
 
         partial void CreateRigidBodies();
         partial void InitializeRigidBodies(CommandBuffer cmd, State state, float dt);
-        partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, float dt);
+        partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, Contacts contacts, float dt);
+        // Per body color, before its solve: contact and attachment forces into the body scratch (Newton's accumulate_*_per_body).
+        partial void AccumulateBodyForces(CommandBuffer cmd, State state, Contacts contacts, int colorStart, int colorSize, float dt);
         partial void FinalizeRigidBodies(CommandBuffer cmd, State state, float dt);
 
         public void Step(CommandBuffer cmd, State state, float dt) => Step(cmd, state, null, dt);
@@ -45,7 +47,7 @@ namespace Vbd
             InitializeContacts(cmd, state, contacts);
             for (var iter = 0; iter < Iterations; iter++)
             {
-                SolveRigidBodyIteration(cmd, state, dt);
+                SolveRigidBodyIteration(cmd, state, contacts, dt);
                 SolveParticleIteration(cmd);
             }
             FinalizeRigidBodies(cmd, state, dt);

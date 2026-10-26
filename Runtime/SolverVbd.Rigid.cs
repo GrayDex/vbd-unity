@@ -238,7 +238,7 @@ namespace Vbd
             cmd.SetBufferData(_rebaseline, RebaselineDone);
         }
 
-        partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, float dt)
+        partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, Contacts contacts, float dt)
         {
             if (_model.BodyCount == 0) return;
             for (var c = 0; c < _model.BodyColorCount; c++)
@@ -248,6 +248,7 @@ namespace Vbd
                 if (size == 0) continue;
                 cmd.SetComputeIntParam(_rigid, RigidId.ColorStart, start);
                 cmd.SetComputeIntParam(_rigid, RigidId.ColorSize, size);
+                AccumulateBodyForces(cmd, state, contacts, start, size, dt);
                 cmd.DispatchCompute(_rigid, _solveRigid, Groups(size), 1, 1);
             }
             if (_hasJointRows) cmd.DispatchCompute(_rigid, _updateDualsJoint, Groups(_model.JointCount), 1, 1);
