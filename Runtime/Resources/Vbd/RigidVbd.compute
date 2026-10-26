@@ -6,6 +6,7 @@
 #pragma kernel SolveRigidBody
 #pragma kernel UpdateDualsJoint
 #pragma kernel UpdateBodyVelocity
+#pragma kernel ApplyJointForces
 
 #include "RigidVbdMath.hlsl"
 #include "RigidWrench.hlsl"
@@ -14,6 +15,7 @@
 #define JOINT_REVOLUTE 1
 #define JOINT_BALL 2
 #define JOINT_FIXED 3
+#define JOINT_FREE 4
 #define JOINT_D6 6
 #define MAXVAL 1e10
 #define MODE_NONE 0
@@ -537,6 +539,112 @@ void EvaluateJoint(int body, int j, inout Wrench acc)
 
 // ---- Kernels ----
 
+// ---- External forces: State.BodyF plus Control.JointF mapped to body wrenches ----
+
+// Per joint: the wrench on the child and the one taken from the parent, each about its body's center of mass.
+struct JointWrench { float3 childF; float3 childT; float3 parentF; float3 parentT; };
+
+// Force and torque per body, world frame (the SpatialVelocity layout).
+StructuredBuffer<SpatialVelocity> _BodyF;
+StructuredBuffer<float> _JointF;
+RWStructuredBuffer<JointWrench> _JointWrench;
+StructuredBuffer<int> _ForceJoints;
+StructuredBuffer<int> _ForceJointsOffsets;
+
+// apply_joint_forces (Newton's XPBD kernels, used by SolverVBD) at the start-of-step poses. Newton adds the wrenches
+// to body_f atomically; here each joint writes its pair and ForwardStepRigidBodies gathers them in joint order.
+[numthreads(64, 1, 1)]
+void ApplyJointForces(uint3 id : SV_DispatchThreadID)
+{
+    int j = (int)id.x;
+    if (j >= _JointCount) return;
+    JointData jd = _Joints[j];
+    JointWrench w = (JointWrench)0;
+    if (jd.enabled == 0 || jd.type == JOINT_FIXED)
+    {
+        _JointWrench[j] = w;
+        return;
+    }
+    Transform xwp = jd.xp, poseP = jd.xp;
+    float3 comP = 0;
+    if (jd.parent >= 0)
+    {
+        poseP = _BodyQ[jd.parent];
+        xwp = TMul(poseP, jd.xp);
+        comP = _BodyCom[jd.parent];
+    }
+    float3 rP = xwp.p - TPoint(poseP, comP);
+    Transform poseC = _BodyQ[jd.child];
+    Transform xwc = TMul(poseC, jd.xc);
+    float3 comC = _BodyCom[jd.child];
+    float3 rC = xwc.p - TPoint(poseC, comC);
+    int s = jd.qdStart;
+    float3 f = 0, t = 0;
+
+    if (jd.type == JOINT_FREE)
+    {
+        // World-frame wrench at the child's center of mass; the reaction is shifted to the parent's.
+        f = float3(_JointF[s], _JointF[s + 1], _JointF[s + 2]);
+        t = float3(_JointF[s + 3], _JointF[s + 4], _JointF[s + 5]);
+        w.childF = f;
+        w.childT = t;
+        if (jd.parent >= 0)
+        {
+            w.parentF = f;
+            w.parentT = t + cross(TPoint(poseC, comC) - TPoint(poseP, comP), f);
+        }
+        _JointWrench[j] = w;
+        return;
+    }
+    if (jd.type == JOINT_BALL) t = float3(_JointF[s], _JointF[s + 1], _JointF[s + 2]);
+    else if (jd.type == JOINT_REVOLUTE || jd.type == JOINT_PRISMATIC || jd.type == JOINT_D6)
+    {
+        for (int k = 0; k < jd.linCount; k++) f += _JointF[s + k] * QRotate(xwp.q, _Dofs[s + k].axis);
+        int a = s + jd.linCount;
+        if (jd.angCount == 1) t += _JointF[a] * QRotate(xwp.q, _Dofs[a].axis);
+        else if (jd.angCount > 1)
+        {
+            float3 coords;
+            float3x3 covectors;
+            EvalAngularCoordinates(a, jd.angCount, xwp.q, xwc.q, coords, covectors);
+            float3 tau = float3(_JointF[a], _JointF[a + 1], jd.angCount == 3 ? _JointF[a + 2] : 0.0);
+            t += mul(transpose(covectors), tau);
+        }
+    }
+    w.childF = f;
+    w.childT = t + cross(rC, f);
+    if (jd.parent >= 0)
+    {
+        w.parentF = f;
+        w.parentT = t + cross(rP, f);
+    }
+    _JointWrench[j] = w;
+}
+
+// Newton's body_f_for_integration of one body: State.BodyF plus its joints' wrenches in ascending joint order.
+void GatherBodyForce(int b, out float3 f, out float3 t)
+{
+    SpatialVelocity bf = _BodyF[b];
+    f = bf.v;
+    t = bf.w;
+    int end = _ForceJointsOffsets[b + 1];
+    for (int k = _ForceJointsOffsets[b]; k < end; k++)
+    {
+        int j = _ForceJoints[k];
+        JointWrench w = _JointWrench[j];
+        if (_Joints[j].child == b)
+        {
+            f += w.childF;
+            t += w.childT;
+        }
+        else
+        {
+            f -= w.parentF;
+            t -= w.parentT;
+        }
+    }
+}
+
 // forward_step_rigid_bodies with Newton's integrate_rigid_body (semi-implicit Euler, gyroscopic term, no damping).
 [numthreads(64, 1, 1)]
 void ForwardStepRigidBodies(uint3 id : SV_DispatchThreadID)
@@ -555,12 +663,14 @@ void ForwardStepRigidBodies(uint3 id : SV_DispatchThreadID)
     float3 com = _BodyCom[b];
     float3x3 I = Rows(_BodyInertia[b]);
     float3x3 invI = Rows(_BodyInvInertia[b]);
+    float3 f0, t0;
+    GatherBodyForce(b, f0, t0);
 
     float3 xCom = q.p + QRotate(q.q, com);
-    float3 v1 = qd.v + _Gravity * _Dt;
+    float3 v1 = qd.v + (f0 * invM + _Gravity) * _Dt;
     float3 x1 = xCom + v1 * _Dt;
     float3 wb = QRotateInv(q.q, qd.w);
-    float3 tb = -cross(wb, mul(I, wb));
+    float3 tb = QRotateInv(q.q, t0) - cross(wb, mul(I, wb));
     float3 w1 = QRotate(q.q, wb + mul(invI, tb) * _Dt);
     float4 r1 = QNormalize(q.q + QMul(float4(w1, 0.0), q.q) * 0.5 * _Dt);
 

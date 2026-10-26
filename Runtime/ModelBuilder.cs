@@ -6,8 +6,8 @@ using UnityEngine;
 namespace Vbd
 {
     // Port of the part of newton.ModelBuilder that SolverVbd needs: particles, tetrahedra, rigid bodies and shapes
-    // (ModelBuilder.Rigid.cs), graph coloring and Finalize. Axes stay as given; the default gravity is Unity's -Y (Newton's is -Z).
-    // Joints are not here yet: Color takes the joint parent/child arrays instead.
+    // (ModelBuilder.Rigid.cs), joints and articulations (ModelBuilder.Joints.cs), graph coloring and Finalize.
+    // Axes stay as given; the default gravity is Unity's -Y (Newton's is -Z).
     public sealed partial class ModelBuilder
     {
         public float3 Gravity = new(0f, -9.81f, 0f);
@@ -162,7 +162,8 @@ namespace Vbd
                 particleRadius);
 
         // color(): fills ParticleColorGroups from the active tetrahedra (Lamé μ or λ not zero, as SolverVbd) and
-        // BodyColorGroups from the joints. Call before Finalize.
+        // BodyColorGroups from the joints, the builder's own unless jointParent and jointChild are given.
+        // Call before Finalize.
         public void Color(bool balanceColors = true, float targetMaxMinColorRatio = 1.1f,
             ColoringAlgorithm algorithm = ColoringAlgorithm.Mcs, IReadOnlyList<int> jointParent = null,
             IReadOnlyList<int> jointChild = null, IReadOnlyList<int2> additionalBodyEdges = null)
@@ -181,8 +182,8 @@ namespace Vbd
                     ParticleColorGroups = new List<int[]> { all };
                 }
             }
-            BodyColorGroups = Coloring.ColorRigidBodies(BodyCount, jointParent, jointChild, balanceColors,
-                targetMaxMinColorRatio, algorithm, additionalBodyEdges);
+            BodyColorGroups = Coloring.ColorRigidBodies(BodyCount, jointParent ?? JointParent, jointChild ?? JointChild,
+                balanceColors, targetMaxMinColorRatio, algorithm, additionalBodyEdges);
         }
 
         static void Flatten(List<int[]> groups, out int[] items, out int[] offsets)
@@ -197,6 +198,7 @@ namespace Vbd
         // correction as Newton's (negative or non-finite mass, non-positive-definite or inconsistent inertia).
         public Model Finalize()
         {
+            ValidateJoints();
             var model = new Model
             {
                 Gravity = Gravity,
@@ -221,6 +223,7 @@ namespace Vbd
                 Flatten(BodyColorGroups, out model.BodyColorBodies, out model.BodyColorOffsets);
             }
             FinalizeRigid(model);
+            FinalizeJoints(model);
             return model;
         }
     }

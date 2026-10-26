@@ -4,7 +4,7 @@ using Unity.Mathematics;
 
 namespace Vbd
 {
-    // Rigid bodies and shapes. Joints are added here when the rigid solver defines them.
+    // Rigid bodies and shapes; joints and AddBody (a body on a free joint) are in ModelBuilder.Joints.cs.
     public sealed partial class ModelBuilder
     {
         // newton.ShapeFlags
@@ -62,6 +62,10 @@ namespace Vbd
         public readonly List<float> BodyInvMass = new();
         public readonly List<float3x3> BodyInvInertia = new();
         public readonly List<bool> BodyLockInertia = new();
+        // Newton's BodyFlags.DYNAMIC; Model.BodyKinematic is the other state a body can have.
+        public const int BodyDynamic = 1 << 0;
+        // Per body: BodyDynamic or Model.BodyKinematic.
+        public readonly List<int> BodyFlags = new();
 
         public readonly List<int> ShapeBody = new();
         public readonly List<Transform> ShapeTransform = new();
@@ -79,16 +83,17 @@ namespace Vbd
 
         static Transform Identity => new(float3.zero, quaternion.identity);
 
-        // add_link + add_body without the free joint: pose, center of mass in the body frame, inertia about it.
-        // lockInertia stops shapes added later from changing the mass properties.
-        public int AddBody(Transform? xform = null, float3? com = null, float3x3? inertia = null, float mass = 0f,
-            bool lockInertia = false)
+        // add_link: a body without a joint; pose, center of mass in the body frame, inertia about it. lockInertia stops
+        // shapes added later from changing the mass properties. Only a body jointed to the world may be kinematic.
+        public int AddLink(Transform? xform = null, float3? com = null, float3x3? inertia = null, float mass = 0f,
+            bool lockInertia = false, bool isKinematic = false)
         {
             var i = inertia ?? default;
             BodyInertia.Add(i);
             BodyMass.Add(mass);
             BodyCom.Add(com ?? float3.zero);
             BodyLockInertia.Add(lockInertia);
+            BodyFlags.Add(isKinematic ? Model.BodyKinematic : BodyDynamic);
             BodyInvMass.Add(mass > 0f ? 1f / mass : 0f);
             BodyInvInertia.Add(Inertia.AnyNonZero(i) ? math.inverse(i) : i);
             BodyQ.Add(xform ?? Identity);
@@ -191,6 +196,7 @@ namespace Vbd
             model.BodyQ = BodyQ.ToArray();
             model.BodyQd = new SpatialVelocity[n];
             model.BodyCom = BodyCom.ToArray();
+            model.BodyFlags = BodyFlags.ToArray();
             model.BodyMass = new float[n];
             model.BodyInvMass = new float[n];
             model.BodyInertia = new float3x3[n];

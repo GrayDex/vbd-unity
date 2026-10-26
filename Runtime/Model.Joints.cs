@@ -30,6 +30,8 @@ namespace Vbd
         public int2[] JointDofDim = { };
         // Joint coordinates at BodyQ: drive targets and limits are measured from them.
         public float[] JointQ = { };
+        // Joint velocities per DOF; the solver does not read them (body velocities live in State).
+        public float[] JointQd = { };
 
         // Per DOF, in the joint's parent frame.
         public float3[] JointAxis = { };
@@ -43,6 +45,8 @@ namespace Vbd
         // Initial drive targets for Control: positions per coordinate, velocities per DOF.
         public float[] JointTargetQ = { };
         public float[] JointTargetQd = { };
+        // Initial generalized joint forces for Control, per DOF; empty means zero.
+        public float[] JointF = { };
 
         public int JointCount => JointType.Length;
         public int JointDofCount => JointAxis.Length;

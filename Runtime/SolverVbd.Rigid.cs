@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Unity.Mathematics;
 using UnityEngine;
@@ -92,7 +93,9 @@ namespace Vbd
             _solveRigid = _rigid.FindKernel("SolveRigidBody");
             _updateDualsJoint = _rigid.FindKernel("UpdateDualsJoint");
             _updateBodyVelocity = _rigid.FindKernel("UpdateBodyVelocity");
-            _rigidKernels = new[] { _forwardStepRigid, _stepJoint, _solveRigid, _updateDualsJoint, _updateBodyVelocity };
+            _applyJointForces = _rigid.FindKernel("ApplyJointForces");
+            _rigidKernels = new[]
+                { _forwardStepRigid, _stepJoint, _solveRigid, _updateDualsJoint, _updateBodyVelocity, _applyJointForces };
 
             // Kinematic bodies get zero inverse mass and inertia, as Newton's body_inv_mass_effective.
             var invMass = new float[n];
@@ -133,9 +136,17 @@ namespace Vbd
             Control = new Control(_model);
             _buffers.Add(Control.JointTargetQ);
             _buffers.Add(Control.JointTargetQd);
+            _buffers.Add(Control.JointF);
+            var (forceJoints, forceOffsets) = ForceJoints(_model);
+            var forceAdj = Upload(forceJoints);
+            var forceAdjOff = Upload(forceOffsets);
+            var jointWrench = Buffer<JointWrench>(_model.JointCount);
 
             foreach (var k in _rigidKernels)
             {
+                _rigid.SetBuffer(k, ForceId.ForceJoints, forceAdj);
+                _rigid.SetBuffer(k, ForceId.ForceJointsOffsets, forceAdjOff);
+                _rigid.SetBuffer(k, ForceId.JointWrench, jointWrench);
                 _rigid.SetBuffer(k, RigidId.BodyQPrev, _bodyQPrev);
                 _rigid.SetBuffer(k, RigidId.BodyInertiaQ, bodyInertiaQ);
                 _rigid.SetBuffer(k, RigidId.JointState, jointState);
@@ -153,6 +164,47 @@ namespace Vbd
                 _rigid.SetBuffer(k, RigidId.Joints, joints);
                 _rigid.SetBuffer(k, RigidId.Dofs, dofs);
             }
+        }
+
+        // External forces: State.BodyF and Control.JointF enter the forward step, as Newton's _body_f_for_integration.
+        static class ForceId
+        {
+            public static readonly int BodyF = Shader.PropertyToID("_BodyF");
+            public static readonly int JointF = Shader.PropertyToID("_JointF");
+            public static readonly int JointWrench = Shader.PropertyToID("_JointWrench");
+            public static readonly int ForceJoints = Shader.PropertyToID("_ForceJoints");
+            public static readonly int ForceJointsOffsets = Shader.PropertyToID("_ForceJointsOffsets");
+        }
+
+        int _applyJointForces;
+
+        // Per joint, apply_joint_forces' wrench on the child and the one taken from the parent, at their centers of mass.
+        [StructLayout(LayoutKind.Sequential)]
+        struct JointWrench
+        {
+            public float3 ChildForce, ChildTorque, ParentForce, ParentTorque;
+        }
+
+        // Per body, the joints that pass Control.JointF to it, ascending as Newton's sequential accumulation: every
+        // enabled joint but FIXED (apply_joint_forces skips it), FREE included; world endpoints left out.
+        static (int[] joints, int[] offsets) ForceJoints(Model model)
+        {
+            var offsets = new int[model.BodyCount + 1];
+            var lists = new List<int>[model.BodyCount];
+            for (var b = 0; b < lists.Length; b++) lists[b] = new List<int>();
+            for (var j = 0; j < model.JointCount; j++)
+            {
+                if (!model.JointEnabled[j] || model.JointType[j] == Model.JointFixed) continue;
+                if (model.JointParent[j] >= 0) lists[model.JointParent[j]].Add(j);
+                lists[model.JointChild[j]].Add(j);
+            }
+            var joints = new List<int>();
+            for (var b = 0; b < lists.Length; b++)
+            {
+                joints.AddRange(lists[b]);
+                offsets[b + 1] = joints.Count;
+            }
+            return (joints.ToArray(), offsets);
         }
 
         const int JointStateStride = 56;
@@ -233,7 +285,10 @@ namespace Vbd
                 cmd.SetComputeBufferParam(_rigid, k, RigidId.BodyQd, state.BodyQd);
                 cmd.SetComputeBufferParam(_rigid, k, RigidId.TargetQ, Control.JointTargetQ);
                 cmd.SetComputeBufferParam(_rigid, k, RigidId.TargetQd, Control.JointTargetQd);
+                cmd.SetComputeBufferParam(_rigid, k, ForceId.BodyF, state.BodyF);
+                cmd.SetComputeBufferParam(_rigid, k, ForceId.JointF, Control.JointF);
             }
+            if (_model.JointCount > 0) cmd.DispatchCompute(_rigid, _applyJointForces, Groups(_model.JointCount), 1, 1);
             cmd.DispatchCompute(_rigid, _forwardStepRigid, Groups(n), 1, 1);
             if (_hasJointRows) cmd.DispatchCompute(_rigid, _stepJoint, Groups(_model.JointCount), 1, 1);
             cmd.SetBufferData(_rebaseline, RebaselineDone);
