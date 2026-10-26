@@ -94,7 +94,8 @@ namespace Vbd.Tests.Editor
 
         static Model BuildBodies(Fixture fx)
         {
-            var builder = new ModelBuilder();
+            // Newton's default up axis Z: the ground plane follows gravity.
+            var builder = new ModelBuilder { Gravity = new float3(0f, 0f, -9.81f) };
             var bodies = fx.Array<float>("in_bodies");
             for (var i = 0; i < fx.Shape("in_bodies")[0]; i++)
             {

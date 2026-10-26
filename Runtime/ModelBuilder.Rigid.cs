@@ -167,9 +167,12 @@ namespace Vbd
             return AddShape(body, GeoType.Plane, xform, cfg, new float3(width, length, 0f), true);
         }
 
-        // add_ground_plane: the plane z = height, infinite.
-        public int AddGroundPlane(float height = 0f, ShapeConfig cfg = null) =>
-            AddShapePlane(new float4(0f, 0f, 1f, -height), null, 0f, 0f, -1, cfg);
+        // add_ground_plane: infinite, `height` along the up axis; up is against Gravity, as Newton derives both from up_axis.
+        public int AddGroundPlane(float height = 0f, ShapeConfig cfg = null)
+        {
+            var up = -math.normalizesafe(Gravity, new float3(0f, -1f, 0f));
+            return AddShapePlane(new float4(up, -height), null, 0f, 0f, -1, cfg);
+        }
 
         // wp.quat_between_vectors; opposite vectors turn half a circle about x, which Warp leaves undefined.
         static quaternion QuatBetweenVectors(float3 a, float3 b)
