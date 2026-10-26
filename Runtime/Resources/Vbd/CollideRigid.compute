@@ -1,0 +1,397 @@
+// Shape-shape contacts: Newton's CollisionPipeline on the explicit pair list (its default broad phase) —
+// compute_shape_aabbs, the explicit broad phase, narrow_phase_primitive_kernel, the GJK/MPR kernel for the
+// convex pairs, and write_contact into the Contacts layout.
+#pragma kernel ComputeShapeAabbs
+#pragma kernel BroadPhaseExplicit
+#pragma kernel NarrowPhasePrimitive
+#pragma kernel NarrowPhaseConvex
+#pragma kernel UnpackContactsA
+#pragma kernel UnpackContactsB
+
+#include "CollisionPrimitive.hlsl"
+#include "OrthonormalBasis.hlsl"
+
+#define GEO_PLANE 1
+#define GEO_SPHERE 3
+#define GEO_CAPSULE 4
+#define GEO_BOX 7
+
+StructuredBuffer<Xform> _BodyQ;
+StructuredBuffer<int> _ShapeBody;
+StructuredBuffer<Xform> _ShapeTransform;
+StructuredBuffer<int> _ShapeType;
+StructuredBuffer<float3> _ShapeScale;
+StructuredBuffer<float> _ShapeMargin;
+StructuredBuffer<float> _ShapeGap;
+StructuredBuffer<int2> _ShapePairs;
+
+// Per shape, written by ComputeShapeAabbs: world bounds grown by margin + gap, scale and margin, world pose.
+RWStructuredBuffer<float3> _AabbLower;
+RWStructuredBuffer<float3> _AabbUpper;
+RWStructuredBuffer<float4> _GeomData;
+RWStructuredBuffer<Xform> _GeomXform;
+// Pairs past the broad phase, and the narrow-phase pairs left for GJK/MPR. Counters: candidates, convex.
+RWStructuredBuffer<int2> _CandidatePairs;
+RWStructuredBuffer<int2> _ConvexPairs;
+RWStructuredBuffer<uint> _Counters;
+
+// The narrow phase writes one packed record per contact (a kernel may bind only 8 UAVs); the unpack kernels spread
+// the records over the separate arrays of Contacts.
+struct ContactRecord
+{
+    int shape0, shape1;
+    float3 point0, point1, offset0, offset1, normal;
+    float margin0, margin1;
+};
+RWStructuredBuffer<uint> _ContactCount;
+RWStructuredBuffer<ContactRecord> _Records;
+RWStructuredBuffer<int> _ContactShape0;
+RWStructuredBuffer<int> _ContactShape1;
+RWStructuredBuffer<float3> _ContactPoint0;
+RWStructuredBuffer<float3> _ContactPoint1;
+RWStructuredBuffer<float3> _ContactOffset0;
+RWStructuredBuffer<float3> _ContactOffset1;
+RWStructuredBuffer<float3> _ContactNormal;
+RWStructuredBuffer<float> _ContactMargin0;
+RWStructuredBuffer<float> _ContactMargin1;
+
+int _ShapeCount;
+int _PairCount;
+int _ContactMax;
+
+// Newton's ContactData: one contact before it is written.
+struct ContactData
+{
+    float3 center;
+    float3 normal;
+    float distance;
+    float radiusA, radiusB, marginA, marginB;
+    int shapeA, shapeB;
+};
+
+Xform BodyInverse(int body)
+{
+    if (body < 0) return XformIdentity();
+    return XformInverse(_BodyQ[body]);
+}
+
+// _write_contact_at_index: core points and surface offsets into the frames of the shapes' bodies.
+void WriteContactAt(ContactData c, uint index, float3 aWorld, float3 bWorld, float3 n)
+{
+    if ((int)index >= _ContactMax) return;
+    Xform invA = BodyInverse(_ShapeBody[c.shapeA]);
+    Xform invB = BodyInverse(_ShapeBody[c.shapeB]);
+    float offsetA = c.radiusA + c.marginA, offsetB = c.radiusB + c.marginB;
+    ContactRecord r;
+    r.shape0 = c.shapeA;
+    r.shape1 = c.shapeB;
+    r.point0 = XformPoint(invA, aWorld);
+    r.point1 = XformPoint(invB, bWorld);
+    r.offset0 = XformVector(invA, offsetA * n);
+    r.offset1 = XformVector(invB, -offsetB * n);
+    r.normal = n;
+    r.margin0 = offsetA;
+    r.margin1 = offsetB;
+    _Records[index] = r;
+}
+
+// write_contact: index -1 takes the next slot if the contact is within the pair's gap, else the given slot.
+void WriteContact(ContactData c, int outputIndex)
+{
+    float totalSeparation = c.radiusA + c.radiusB + c.marginA + c.marginB;
+    float3 n = WarpNormalize(c.normal);
+    float3 a = c.center - n * (0.5 * c.distance + c.radiusA);
+    float3 b = c.center + n * (0.5 * c.distance + c.radiusB);
+    float d = dot(b - a, n) - totalSeparation;
+    uint index = (uint)outputIndex;
+    if (outputIndex < 0)
+    {
+        if (d > _ShapeGap[c.shapeA] + _ShapeGap[c.shapeB]) return;
+        InterlockedAdd(_ContactCount[0], 1, index);
+    }
+    WriteContactAt(c, index, a, b, n);
+}
+
+// _contact_passes_gap_check_precomputed
+bool PassesGap(ContactData c, float3 n, float totalSeparation, float gapSum)
+{
+    float3 a = c.center - n * (0.5 * c.distance + c.radiusA);
+    float3 b = c.center + n * (0.5 * c.distance + c.radiusB);
+    return dot(b - a, n) - totalSeparation <= gapSum;
+}
+
+#include "CollisionConvex.hlsl"
+
+[numthreads(64, 1, 1)]
+void ComputeShapeAabbs(uint3 id : SV_DispatchThreadID)
+{
+    int s = (int)id.x;
+    if (s == 0)
+    {
+        _Counters[0] = 0;
+        _Counters[1] = 0;
+        _ContactCount[0] = 0;
+    }
+    if (s >= _ShapeCount) return;
+    int body = _ShapeBody[s];
+    Xform x = _ShapeTransform[s];
+    if (body >= 0) x = XformMul(_BodyQ[body], x);
+    float margin = _ShapeMargin[s];
+    float g = margin + _ShapeGap[s];
+    float3 gap = float3(g, g, g);
+    float3 scale = _ShapeScale[s];
+    int type = _ShapeType[s];
+    float3 geomScale = scale;
+    float3 lo = 0, hi = 0;
+    float3 r0 = QuatRotate(x.q, float3(1, 0, 0)), r1 = QuatRotate(x.q, float3(0, 1, 0)), r2 = QuatRotate(x.q, float3(0, 0, 1));
+    if (type == GEO_PLANE && scale.x == 0.0 && scale.y == 0.0)
+    {
+        // An infinite plane bounds the half space below it, clamped where its normal is near an axis.
+        const float extent = 1.0e6;
+        float3 nrm = r2;
+        lo = x.p - extent - gap;
+        hi = x.p + extent + gap;
+        for (int i = 0; i < 3; i++)
+        {
+            float ni = nrm[i];
+            if (abs(ni) > 0.5)
+            {
+                float lateral = abs(nrm[(i + 1) % 3]) + abs(nrm[(i + 2) % 3]);
+                float rise = lateral * extent / abs(ni);
+                if (ni > 0.0) hi[i] = min(hi[i], x.p[i] + rise + g);
+                else lo[i] = max(lo[i], x.p[i] - rise - g);
+            }
+        }
+    }
+    else if (type == GEO_SPHERE)
+    {
+        lo = x.p - scale.x - gap;
+        hi = x.p + scale.x + gap;
+    }
+    else if (type == GEO_BOX)
+    {
+        float3 h = float3(abs(r0.x) * scale.x + abs(r1.x) * scale.y + abs(r2.x) * scale.z,
+                          abs(r0.y) * scale.x + abs(r1.y) * scale.y + abs(r2.y) * scale.z,
+                          abs(r0.z) * scale.x + abs(r1.z) * scale.y + abs(r2.z) * scale.z);
+        lo = x.p - h - gap;
+        hi = x.p + h + gap;
+    }
+    else if (type == GEO_CAPSULE)
+    {
+        float3 h = scale.x + abs(r2) * scale.y;
+        lo = x.p - h - gap;
+        hi = x.p + h + gap;
+    }
+    else if (type == GEO_PLANE)
+    {
+        // compute_tight_aabb_from_support on the finite plane's rectangle.
+        geomScale = float3(scale.x * 0.5, scale.y * 0.5, 0.0);
+        float3x3 rt = transpose(QuatToMatrix(x.q));
+        float3 ext = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            float3 axis = float3(rt[0][i], rt[1][i], rt[2][i]);
+            float3 sMax = float3(axis.x >= 0.0 ? geomScale.x : -geomScale.x, axis.y >= 0.0 ? geomScale.y : -geomScale.y, 0.0);
+            float3 sMin = float3(-axis.x >= 0.0 ? geomScale.x : -geomScale.x, -axis.y >= 0.0 ? geomScale.y : -geomScale.y, 0.0);
+            hi[i] = dot(axis, sMax);
+            lo[i] = dot(axis, sMin);
+        }
+        lo = lo + x.p - gap;
+        hi = hi + x.p + gap;
+    }
+    _AabbLower[s] = lo;
+    _AabbUpper[s] = hi;
+    _GeomData[s] = float4(geomScale, margin);
+    _GeomXform[s] = x;
+}
+
+// _nxn_broadphase_precomputed_pairs: same-body and static-static pairs dropped, then the AABB overlap.
+[numthreads(64, 1, 1)]
+void BroadPhaseExplicit(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _PairCount) return;
+    int2 pair = _ShapePairs[i];
+    int ba = _ShapeBody[pair.x], bb = _ShapeBody[pair.y];
+    if (ba >= 0 && ba == bb) return;
+    if (ba < 0 && bb < 0) return;
+    float3 la = _AabbLower[pair.x], ua = _AabbUpper[pair.x], lb = _AabbLower[pair.y], ub = _AabbUpper[pair.y];
+    if (la.x > ub.x || ua.x < lb.x || la.y > ub.y || ua.y < lb.y || la.z > ub.z || ua.z < lb.z) return;
+    uint slot;
+    InterlockedAdd(_Counters[0], 1, slot);
+    if ((int)slot < _PairCount) _CandidatePairs[slot] = pair;
+}
+
+[numthreads(64, 1, 1)]
+void NarrowPhasePrimitive(uint3 id : SV_DispatchThreadID)
+{
+    int t = (int)id.x;
+    if (t >= min(_PairCount, (int)_Counters[0])) return;
+    int2 pair = _CandidatePairs[t];
+    int shapeA = pair.x, shapeB = pair.y;
+    if (shapeA == shapeB || shapeA < 0 || shapeB < 0) return;
+    int typeA = _ShapeType[shapeA], typeB = _ShapeType[shapeB];
+    // Sorted by type, so the plane comes first and the box last.
+    if (typeA > typeB)
+    {
+        int s = shapeA; shapeA = shapeB; shapeB = s;
+        s = typeA; typeA = typeB; typeB = s;
+    }
+    float4 dataA = _GeomData[shapeA], dataB = _GeomData[shapeB];
+    float3 scaleA = dataA.xyz, scaleB = dataB.xyz;
+    // Capsule-box and box-box have no analytic path.
+    if (typeA == GEO_BOX || (typeA == GEO_CAPSULE && typeB > GEO_CAPSULE))
+    {
+        uint slot;
+        InterlockedAdd(_Counters[1], 1, slot);
+        if ((int)slot < _PairCount) _ConvexPairs[slot] = int2(shapeA, shapeB);
+        return;
+    }
+    Xform xa = _GeomXform[shapeA], xb = _GeomXform[shapeB];
+    float gapSum = _ShapeGap[shapeA] + _ShapeGap[shapeB];
+    bool sphereA = typeA == GEO_SPHERE, sphereB = typeB == GEO_SPHERE;
+    bool capsuleA = typeA == GEO_CAPSULE, capsuleB = typeB == GEO_CAPSULE;
+    bool planeA = typeA == GEO_PLANE;
+    ContactData c;
+    c.radiusA = sphereA || capsuleA ? scaleA.x : 0.0;
+    c.radiusB = sphereB || capsuleB ? scaleB.x : 0.0;
+    c.marginA = dataA.w;
+    c.marginB = dataB.w;
+    c.shapeA = shapeA;
+    c.shapeB = shapeB;
+    float4 dist = MAXVAL;
+    float3 pos[4];
+    pos[0] = 0; pos[1] = 0; pos[2] = 0; pos[3] = 0;
+    float3 n = 0;
+    if (planeA && sphereB)
+    {
+        n = QuatRotate(xa.q, float3(0, 0, 1));
+        CollidePlaneSphere(n, xa.p, xb.p, scaleB.x, dist.x, pos[0]);
+    }
+    else if (planeA && typeB == GEO_BOX)
+    {
+        n = QuatRotate(xa.q, float3(0, 0, 1));
+        CollidePlaneBox(n, xa.p, xb.p, QuatToMatrix(xb.q), scaleB, gapSum + c.marginA + c.marginB, dist, pos[0], pos[1],
+                        pos[2], pos[3]);
+    }
+    else if (sphereA && sphereB)
+        CollideSphereSphere(xa.p, scaleA.x, xb.p, scaleB.x, dist.x, pos[0], n);
+    else if (planeA && capsuleB)
+    {
+        n = QuatRotate(xa.q, float3(0, 0, 1));
+        float2 d2;
+        CollidePlaneCapsule(n, xa.p, xb.p, QuatRotate(xb.q, float3(0, 0, 1)), scaleB.x, scaleB.y, d2, pos[0], pos[1]);
+        dist.xy = d2;
+    }
+    else if (sphereA && capsuleB)
+        CollideSphereCapsule(xa.p, scaleA.x, xb.p, QuatRotate(xb.q, float3(0, 0, 1)), scaleB.x, scaleB.y, dist.x, pos[0], n);
+    else if (capsuleA && capsuleB)
+    {
+        float2 d2;
+        CollideCapsuleCapsule(xa.p, QuatRotate(xa.q, float3(0, 0, 1)), scaleA.x, scaleA.y, xb.p,
+                              QuatRotate(xb.q, float3(0, 0, 1)), scaleB.x, scaleB.y, d2, pos[0], pos[1], n);
+        dist.xy = d2;
+    }
+    else if (sphereA && typeB == GEO_BOX)
+        CollideSphereBox(xa.p, scaleA.x, xb.p, QuatToMatrix(xb.q), scaleB, dist.x, pos[0], n);
+    else
+        return;
+
+    c.normal = n;
+    float totalSeparation = c.radiusA + c.radiusB + c.marginA + c.marginB;
+    float3 nn = WarpNormalize(n);
+    bool valid[4];
+    int numValid = 0;
+    for (int k = 0; k < 4; k++)
+    {
+        c.center = pos[k];
+        c.distance = dist[k];
+        valid[k] = dist[k] < MAXVAL && PassesGap(c, nn, totalSeparation, gapSum);
+        numValid += valid[k] ? 1 : 0;
+    }
+    if (numValid == 0) return;
+    uint base;
+    InterlockedAdd(_ContactCount[0], (uint)numValid, base);
+    // A batch that would overflow is dropped whole; the count still records it.
+    if ((int)(base + numValid) > _ContactMax) return;
+    for (int k2 = 0; k2 < 4; k2++)
+    {
+        if (!valid[k2]) continue;
+        c.center = pos[k2];
+        c.distance = dist[k2];
+        WriteContact(c, (int)base);
+        base++;
+    }
+}
+
+// narrow_phase_kernel_gjk_mpr and create_find_contacts: the convex pairs routed by NarrowPhasePrimitive.
+[numthreads(64, 1, 1)]
+void NarrowPhaseConvex(uint3 id : SV_DispatchThreadID)
+{
+    int t = (int)id.x;
+    if (t >= min(_PairCount, (int)_Counters[1])) return;
+    int2 pair = _ConvexPairs[t];
+    int shapeA = pair.x, shapeB = pair.y;
+    if (shapeA == shapeB || shapeA < 0 || shapeB < 0) return;
+    if ((int)_ContactCount[0] >= _ContactMax) return;
+    float4 dataA = _GeomData[shapeA], dataB = _GeomData[shapeB];
+    Xform xa = _GeomXform[shapeA], xb = _GeomXform[shapeB];
+    Geom a, b;
+    a.type = _ShapeType[shapeA];
+    b.type = _ShapeType[shapeB];
+    a.scale = dataA.xyz;
+    b.scale = dataB.xyz;
+    // _penetration_bounds_half of the original dimensions.
+    a.bounds = a.type == GEO_CAPSULE ? float3(a.scale.x, a.scale.x, a.scale.x + a.scale.y) : a.scale;
+    b.bounds = b.type == GEO_CAPSULE ? float3(b.scale.x, b.scale.x, b.scale.x + b.scale.y) : b.scale;
+    ContactData c;
+    c.center = 0;
+    c.normal = 0;
+    c.distance = 0;
+    c.radiusA = 0;
+    c.radiusB = 0;
+    c.marginA = dataA.w;
+    c.marginB = dataB.w;
+    c.shapeA = shapeA;
+    c.shapeB = shapeB;
+    // Spheres and capsules are Minkowski objects: their core shrinks to a small radius, the rest is added back.
+    if (a.type == GEO_SPHERE || a.type == GEO_CAPSULE)
+    {
+        c.radiusA = a.scale.x;
+        a.scale.x = 1.0e-4;
+    }
+    if (b.type == GEO_SPHERE || b.type == GEO_CAPSULE)
+    {
+        c.radiusB = b.scale.x;
+        b.scale.x = 1.0e-4;
+    }
+    float gapSum = _ShapeGap[shapeA] + _ShapeGap[shapeB];
+    bool skipMultiContact = a.type == GEO_SPHERE || b.type == GEO_SPHERE;
+    SolveConvexMultiContact(a, b, xa.q, xb.q, xa.p, xb.p, gapSum + c.radiusA + c.radiusB + c.marginA + c.marginB,
+                            skipMultiContact, c);
+}
+
+[numthreads(64, 1, 1)]
+void UnpackContactsA(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ContactMax || i >= (int)_ContactCount[0]) return;
+    ContactRecord r = _Records[i];
+    _ContactShape0[i] = r.shape0;
+    _ContactShape1[i] = r.shape1;
+    _ContactPoint0[i] = r.point0;
+    _ContactPoint1[i] = r.point1;
+    _ContactOffset0[i] = r.offset0;
+}
+
+[numthreads(64, 1, 1)]
+void UnpackContactsB(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ContactMax || i >= (int)_ContactCount[0]) return;
+    ContactRecord r = _Records[i];
+    _ContactOffset1[i] = r.offset1;
+    _ContactNormal[i] = r.normal;
+    _ContactMargin0[i] = r.margin0;
+    _ContactMargin1[i] = r.margin1;
+}
