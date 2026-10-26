@@ -1,0 +1,335 @@
+// Body-body contacts on Newton's compliant-ALM path (rigid_vbd_kernels.py): build_body_body_contact_lists,
+// init_body_body_contact_materials, step_body_body_contact_C0_lambda, accumulate_body_body_contacts_per_body
+// with evaluate_rigid_contact_from_collision, and update_duals_body_body_contacts.
+#pragma kernel ClearBodyBodyHeads
+#pragma kernel InitBodyBodyContacts
+#pragma kernel AccumulateBodyBodyContacts
+#pragma kernel UpdateDualsBodyBodyContacts
+
+#include "RigidWrench.hlsl"
+#include "OrthonormalBasis.hlsl"
+
+#define SMALL_LENGTH_EPS 1.0e-9
+
+StructuredBuffer<uint> _ContactCount;
+StructuredBuffer<int> _ContactShape0;
+StructuredBuffer<int> _ContactShape1;
+StructuredBuffer<float3> _ContactPoint0;
+StructuredBuffer<float3> _ContactPoint1;
+StructuredBuffer<float3> _ContactOffset0;
+StructuredBuffer<float3> _ContactOffset1;
+StructuredBuffer<float3> _ContactNormal;
+StructuredBuffer<float> _ContactMargin0;
+StructuredBuffer<float> _ContactMargin1;
+StructuredBuffer<int> _ShapeBody;
+StructuredBuffer<float> _ShapeMaterialKe;
+StructuredBuffer<float> _ShapeMaterialKd;
+StructuredBuffer<float> _ShapeMaterialMu;
+StructuredBuffer<Transform> _BodyQ;
+StructuredBuffer<Transform> _BodyQPrev;
+StructuredBuffer<float3> _BodyCom;
+StructuredBuffer<float> _BodyInvMass;
+StructuredBuffer<Mat33> _BodyInvInertia;
+// 1 where an enabled joint with a structural linear row touches the body (Newton's body_structural_k / ke).
+StructuredBuffer<int> _BodyStructural;
+StructuredBuffer<int> _ColorBodies;
+
+// Per body, a linked list of its contacts; an entry is 2 * contact + side (0: the body holds shape 0).
+RWStructuredBuffer<int> _BodyContactHead;
+RWStructuredBuffer<int> _BodyContactNext;
+// Per contact: material ke, kd, mu; ALM normal and tangent rho; multiplier; C0 snapshot.
+RWStructuredBuffer<float3> _ContactMaterial;
+RWStructuredBuffer<float2> _ContactRho;
+RWStructuredBuffer<float3> _ContactLambda;
+RWStructuredBuffer<float3> _ContactC0;
+RWStructuredBuffer<Wrench> _BodyForces;
+
+int _BodyCount;
+int _ContactMax;
+int _ColorStart;
+int _ColorSize;
+int _AddToBodyForces;
+float _Dt;
+float _FrictionEpsilon;
+float _StructuralKe;
+float _Alpha;
+
+// ---- Compliant ALM coefficient algebra (as in RigidVbd.compute) ----
+
+void AlmCoefficients(float k, float rho, out float s, out float keff, out float a)
+{
+    if (k <= 0.0 || rho <= 0.0)
+    {
+        s = 0.0; keff = 0.0; a = 1.0;
+        return;
+    }
+    if (k >= rho)
+    {
+        float r = rho / k;
+        s = 1.0 / (1.0 + r); keff = rho * s; a = r * s;
+        return;
+    }
+    float r = k / rho;
+    a = 1.0 / (1.0 + r); s = r * a; keff = k * a;
+}
+
+float AlmRelaxedAscent(float lam, float R, float k, float rho)
+{
+    float s, keff, a;
+    AlmCoefficients(k, rho, s, keff, a);
+    if (k >= rho) return lam + (keff * R - a * lam);
+    return s * lam + keff * R;
+}
+
+float3 ProjectCoulombTangent(float3 t, float len, float cone)
+{
+    if (cone <= 0.0) return 0;
+    if (len > cone) return t * (cone / len);
+    return t;
+}
+
+float RegularizedCoulombScale(float u, float eps)
+{
+    if (u > eps && u > 0.0) return 1.0 / u;
+    if (eps > 0.0) return (-u / eps + 2.0) / eps;
+    return 0.0;
+}
+
+float SeriesScale(float a, float b)
+{
+    if (a <= 0.0 || b <= 0.0) return 0.0;
+    float lo = min(a, b), hi = max(a, b);
+    return lo / (1.0 + lo / hi);
+}
+
+int BodyOf(int shape) { return shape >= 0 ? _ShapeBody[shape] : -1; }
+float StructuralK(int b) { return _BodyStructural[b] != 0 && _StructuralKe > 0.0 ? _StructuralKe : 0.0; }
+float3 WorldPoint(int b, float3 p) { return b >= 0 ? TPoint(_BodyQ[b], p) : p; }
+float3 PrevPoint(int b, float3 p) { return b >= 0 ? TPoint(_BodyQPrev[b], p) : p; }
+
+// _contact_body_conditioning_scale: D_b + S_b of one dynamic endpoint, zero for the world or a kinematic body.
+float BodyConditioningScale(int shape, float3 pLocal, float3 n, float invDtSq)
+{
+    int b = BodyOf(shape);
+    if (b < 0) return 0.0;
+    float w = _BodyInvMass[b];
+    if (w > 0.0)
+    {
+        float3 u = cross(pLocal - _BodyCom[b], QRotateInv(_BodyQ[b].q, n));
+        w = w + dot(u, mul(Rows(_BodyInvInertia[b]), u));
+    }
+    if (w <= 0.0) return 0.0;
+    return invDtSq / w + StructuralK(b);
+}
+
+// _contact_body_tangent_block: (w00, w01, w11).
+float3 TangentBlock(int shape, float3 anchorLocal, float3 t0, float3 t1)
+{
+    int b = BodyOf(shape);
+    if (b < 0 || _BodyInvMass[b] <= 0.0) return 0;
+    float4 rot = _BodyQ[b].q;
+    float3 r = anchorLocal - _BodyCom[b];
+    float3 u0 = cross(r, QRotateInv(rot, t0));
+    float3 u1 = cross(r, QRotateInv(rot, t1));
+    float3x3 invI = Rows(_BodyInvInertia[b]);
+    float m = _BodyInvMass[b];
+    return float3(m + dot(u0, mul(invI, u0)), dot(u0, mul(invI, u1)), m + dot(u1, mul(invI, u1)));
+}
+
+[numthreads(64, 1, 1)]
+void ClearBodyBodyHeads(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _BodyCount) _BodyContactHead[id.x] = -1;
+}
+
+void PushContact(int body, int entry)
+{
+    if (body < 0 || _BodyInvMass[body] <= 0.0) return;
+    int previous;
+    InterlockedExchange(_BodyContactHead[body], entry, previous);
+    _BodyContactNext[entry] = previous;
+}
+
+// Once per step on the collide-frame poses, before the forward step. Without contact history (Newton's default)
+// the multiplier starts at zero, so the retention of step_body_body_contact_C0_lambda has nothing to keep.
+[numthreads(64, 1, 1)]
+void InitBodyBodyContacts(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ContactMax || i >= (int)_ContactCount[0]) return;
+    int s0 = _ContactShape0[i], s1 = _ContactShape1[i];
+    int b0 = BodyOf(s0), b1 = BodyOf(s1);
+    PushContact(b0, 2 * i);
+    PushContact(b1, 2 * i + 1);
+    if (s0 < 0 || s1 < 0) return;
+
+    float ke = 0.5 * (_ShapeMaterialKe[s0] + _ShapeMaterialKe[s1]);
+    _ContactMaterial[i] = float3(ke, 0.5 * (_ShapeMaterialKd[s0] + _ShapeMaterialKd[s1]),
+                                 sqrt(_ShapeMaterialMu[s0] * _ShapeMaterialMu[s1]));
+    _ContactLambda[i] = 0;
+
+    float3 n = _ContactNormal[i];
+    float3 p0 = _ContactPoint0[i], p1 = _ContactPoint1[i];
+    float3 anchor0 = p0 + _ContactOffset0[i], anchor1 = p1 + _ContactOffset1[i];
+    float c0n = -(dot(n, WorldPoint(b1, p1) - WorldPoint(b0, p0)) - (_ContactMargin0[i] + _ContactMargin1[i]));
+    float3 dSurf = WorldPoint(b1, anchor1) - WorldPoint(b0, anchor0);
+    _ContactC0[i] = n * c0n - (dSurf - n * dot(n, dSurf));
+
+    float invDtSq = 1.0 / (_Dt * _Dt);
+    float scale0 = BodyConditioningScale(s0, p0, n, invDtSq), scale1 = BodyConditioningScale(s1, p1, n, invDtSq);
+    float normalSupport = scale0 > 0.0 && scale1 > 0.0 ? SeriesScale(scale0, scale1) : max(scale0, scale1);
+    float normalRho = normalSupport <= 0.0 || ke <= 0.0 ? 0.0 : normalSupport;
+
+    float3 t0, t1;
+    OrthonormalBasis(n, t0, t1);
+    float3 w = TangentBlock(s0, anchor0, t0, t1) + TangentBlock(s1, anchor1, t0, t1);
+    float trace = w.x + w.z;
+    float tangentSupport = 0.0;
+    if (trace > 0.0)
+    {
+        float disc = sqrt(max((w.x - w.z) * (w.x - w.z) + 4.0 * w.y * w.y, 0.0));
+        tangentSupport = invDtSq / (0.5 * (trace + disc));
+    }
+    bool dyn0 = b0 >= 0 && _BodyInvMass[b0] > 0.0, dyn1 = b1 >= 0 && _BodyInvMass[b1] > 0.0;
+    float k0 = dyn0 ? StructuralK(b0) : 0.0, k1 = dyn1 ? StructuralK(b1) : 0.0;
+    float structural = dyn0 && dyn1 ? SeriesScale(k0, k1) : max(k0, k1);
+    _ContactRho[i] = float2(normalRho, max(tangentSupport, min(normalRho, structural)));
+}
+
+// evaluate_rigid_contact_from_collision on the compliant-ALM path: the wrench on the body holding shape `side`.
+Wrench EvaluateContact(int c, int side)
+{
+    Wrench zero = ZeroWrench();
+    int b0 = BodyOf(_ContactShape0[c]), b1 = BodyOf(_ContactShape1[c]);
+    float3 p0 = _ContactPoint0[c], p1 = _ContactPoint1[c];
+    float3 n = _ContactNormal[c];
+    float3 mat = _ContactMaterial[c];
+    float2 rho = _ContactRho[c];
+    float3 lam = _ContactLambda[c];
+    float3 c0 = _ContactC0[c];
+
+    // accumulate_body_body_contacts_per_body: normal depth on the core points, C0 stabilization, early outs.
+    float cn = -(dot(n, WorldPoint(b1, p1) - WorldPoint(b0, p0)) - (_ContactMargin0[c] + _ContactMargin1[c]));
+    float lamN = dot(lam, n);
+    float c0n = dot(n, c0);
+    float cEff = cn - _Alpha * c0n;
+    float3 frictionC0 = (1.0 - _Alpha) * (c0 - n * c0n);
+    if (cn <= SMALL_LENGTH_EPS && lamN <= 0.0) return zero;
+    float s, keff, a;
+    AlmCoefficients(mat.x, rho.x, s, keff, a);
+    if (keff * cEff + lamN * s <= 0.0 && lamN <= 0.0) return zero;
+
+    // _contact_force_terms: the ALM scale applies to the normal multiplier only.
+    float3 lamEff = n * (lamN * s) + (lam - n * lamN);
+    float lamNEff = dot(lamEff, n);
+    if (cEff <= SMALL_LENGTH_EPS && lamNEff <= 0.0) return zero;
+    float fn = keff * cEff + lamNEff;
+    if (keff <= 0.0) return zero;
+    fn = max(fn, 0.0);
+    if (fn == 0.0) return zero;
+
+    Transform xa = TransformIdentity(), xaPrev = TransformIdentity(), xb = TransformIdentity(), xbPrev = TransformIdentity();
+    float3 comA = 0, comB = 0;
+    if (b0 >= 0) { xa = _BodyQ[b0]; xaPrev = _BodyQPrev[b0]; comA = _BodyCom[b0]; }
+    if (b1 >= 0) { xb = _BodyQ[b1]; xbPrev = _BodyQPrev[b1]; comB = _BodyCom[b1]; }
+    float3 anchor0 = p0 + _ContactOffset0[c], anchor1 = p1 + _ContactOffset1[c];
+    float3 comANow = TPoint(xa, comA), comBNow = TPoint(xb, comB);
+    float3 sa = TPoint(xa, p0), sb = TPoint(xb, p1);
+    float3 ca = TPoint(xa, anchor0), cb = TPoint(xb, anchor1);
+    float3x3 nn = Outer(n, n);
+    float3x3 I3 = Identity3();
+
+    float vDotN = dot(n, (sb - TPoint(xbPrev, p1) - sa + TPoint(xaPrev, p0)) / _Dt);
+    float3 vRelT = (cb - TPoint(xbPrev, anchor1) - ca + TPoint(xaPrev, anchor0)) / _Dt;
+    float3 vT = vRelT - n * dot(n, vRelT);
+
+    float3 fnVec = n * fn;
+    float3x3 kn = keff * nn;
+    float3 ft = 0;
+    float3x3 kt = 0;
+    float mu = mat.z;
+    if (mu > 0.0 && fn > 0.0)
+    {
+        float rhoT = rho.y;
+        float3 disp = -(vT * _Dt);
+        float3 lamT = lamEff - n * lamNEff;
+        ft = rhoT * (disp + frictionC0) + lamT;
+        float ftLen = length(ft);
+        float cone = mu * fn;
+        if (ftLen > cone)
+        {
+            // Outside the cone the projection has no slip-direction stiffness: a PSD solve metric stands in.
+            float3 tHat = ft / ftLen;
+            float3x3 tt = Outer(tHat, tHat);
+            float metric = cone * RegularizedCoulombScale(length(disp), _FrictionEpsilon * _Dt);
+            kt = (cone / ftLen) * rhoT * (I3 - nn - tt) + metric * tt;
+        }
+        else
+            kt = rhoT * (I3 - nn);
+        ft = ProjectCoulombTangent(ft, ftLen, cone);
+    }
+    float kd = mat.y;
+    if (kd > 0.0 && vDotN < 0.0 && fn > 0.0)
+    {
+        fnVec = fnVec - kd * vDotN * n;
+        kn = kn + (kd / _Dt) * nn;
+    }
+
+    // The normal block acts at the core point, friction at the surface anchor.
+    float3 rs = side == 0 ? sa - comANow : sb - comBNow;
+    float3 rc = side == 0 ? ca - comANow : cb - comBNow;
+    float3x3 rsT = transpose(Skew(rs)), rcT = transpose(Skew(rc));
+    float sign = side == 0 ? -1.0 : 1.0;
+    Wrench w;
+    w.f = sign * (fnVec + ft);
+    w.t = cross(rs, sign * fnVec) + cross(rc, sign * ft);
+    w.hll = kn + kt;
+    w.hal = -(mul(rsT, kn) + mul(rcT, kt));
+    w.haa = mul(mul(rsT, kn), Skew(rs)) + mul(mul(rcT, kt), Skew(rc));
+    return w;
+}
+
+// One thread per body of the color, after the body-particle contacts of the same color.
+[numthreads(64, 1, 1)]
+void AccumulateBodyBodyContacts(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _ColorSize) return;
+    int b = _ColorBodies[_ColorStart + (int)id.x];
+    Wrench acc = ZeroWrench();
+    if (_AddToBodyForces != 0) acc = _BodyForces[b];
+    if (_BodyInvMass[b] > 0.0)
+        for (int e = _BodyContactHead[b]; e >= 0; e = _BodyContactNext[e])
+            acc = AddWrench(acc, EvaluateContact(e >> 1, e & 1));
+    _BodyForces[b] = acc;
+}
+
+// After every iteration: normal multiplier by relaxed ascent, tangent one projected into the new Coulomb disk.
+[numthreads(64, 1, 1)]
+void UpdateDualsBodyBodyContacts(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ContactMax || i >= (int)_ContactCount[0]) return;
+    int s0 = _ContactShape0[i], s1 = _ContactShape1[i];
+    if (s0 < 0 || s1 < 0) return;
+    int b0 = _ShapeBody[s0], b1 = _ShapeBody[s1];
+    if (b0 < 0 && b1 < 0) return;
+    float3 p0 = _ContactPoint0[i], p1 = _ContactPoint1[i];
+    float3 anchor0 = p0 + _ContactOffset0[i], anchor1 = p1 + _ContactOffset1[i];
+    float3 n = _ContactNormal[i];
+    float cnRaw = -(dot(n, WorldPoint(b1, p1) - WorldPoint(b0, p0)) - (_ContactMargin0[i] + _ContactMargin1[i]));
+    float3 mat = _ContactMaterial[i];
+    float2 rho = _ContactRho[i];
+    float3 lam = _ContactLambda[i];
+    float3 c0 = _ContactC0[i];
+    float c0n = dot(n, c0);
+    float cStab = cnRaw < 0.0 ? cnRaw : cnRaw - _Alpha * c0n;
+    float3 rel = (WorldPoint(b0, anchor0) - PrevPoint(b0, anchor0)) - (WorldPoint(b1, anchor1) - PrevPoint(b1, anchor1));
+    float3 tangentResidual = rel - n * dot(n, rel) + (1.0 - _Alpha) * (c0 - n * c0n);
+
+    // _compliant_contact_dual_step
+    float lamNOld = dot(lam, n);
+    float3 lamTOld = lam - n * lamNOld;
+    float lamNNew = max(AlmRelaxedAscent(lamNOld, cStab, mat.x, rho.x), 0.0);
+    float3 trial = lamTOld + rho.y * tangentResidual;
+    _ContactLambda[i] = n * lamNNew + ProjectCoulombTangent(trial, length(trial), mat.z * lamNNew);
+}

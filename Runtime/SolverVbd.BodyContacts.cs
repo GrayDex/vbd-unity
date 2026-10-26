@@ -104,17 +104,23 @@ namespace Vbd
             cmd.DispatchCompute(_bodyContacts, build, Groups(contacts.SoftContactMax), 1, 1);
         }
 
+        // Newton's order: body-particle contacts write the color's wrenches, body-body contacts add to them (or write
+        // them when no particle contacts were gathered). Particle-body attachments, first in Newton, are not ported.
         partial void AccumulateBodyForces(CommandBuffer cmd, Contacts contacts, int colorStart, int colorSize, float dt)
         {
+            var particles = _bodyContacts != null && contacts != null;
+            var bodies = _bodyBody != null && contacts != null;
             // Without contacts reaching bodies the solve skips the gathered forces.
-            var active = _bodyContacts != null && contacts != null;
             cmd.SetComputeBufferParam(_rigid, _solveRigid, BodyContactId.BodyForces, _bodyForces);
-            cmd.SetComputeIntParam(_rigid, BodyContactId.HasBodyForces, active ? 1 : 0);
-            if (!active) return;
-            cmd.SetComputeIntParam(_bodyContacts, BodyContactId.ColorStart, colorStart);
-            cmd.SetComputeIntParam(_bodyContacts, BodyContactId.ColorSize, colorSize);
-            cmd.SetComputeFloatParam(_bodyContacts, BodyContactId.Dt, dt);
-            cmd.DispatchCompute(_bodyContacts, _accumulateBodyContacts, Groups(colorSize), 1, 1);
+            cmd.SetComputeIntParam(_rigid, BodyContactId.HasBodyForces, particles || bodies ? 1 : 0);
+            if (particles)
+            {
+                cmd.SetComputeIntParam(_bodyContacts, BodyContactId.ColorStart, colorStart);
+                cmd.SetComputeIntParam(_bodyContacts, BodyContactId.ColorSize, colorSize);
+                cmd.SetComputeFloatParam(_bodyContacts, BodyContactId.Dt, dt);
+                cmd.DispatchCompute(_bodyContacts, _accumulateBodyContacts, Groups(colorSize), 1, 1);
+            }
+            if (bodies) AccumulateBodyBodyContacts(cmd, colorStart, colorSize, particles);
         }
     }
 }

@@ -28,6 +28,10 @@ namespace Vbd
             // Null takes ModelBuilder.RigidGap.
             public float? Gap;
             public bool IsSolid = true;
+            // See Model.ShapeCollisionGroup.
+            public int CollisionGroup = 1;
+            // Filters collisions with the shapes of bodies jointed to this shape's body (joints that filter).
+            public bool CollisionFilterParent = true;
             public bool HasShapeCollision = true;
             public bool HasParticleCollision = true;
             public bool IsVisible = true;
@@ -77,6 +81,10 @@ namespace Vbd
         public readonly List<float> ShapeMaterialKe = new();
         public readonly List<float> ShapeMaterialKd = new();
         public readonly List<float> ShapeMaterialMu = new();
+        public readonly List<int> ShapeCollisionGroup = new();
+        readonly List<int2> _shapeCollisionFilterPairs = new();
+        // Newton's body_shapes: shapes per body, -1 for the world.
+        readonly Dictionary<int, List<int>> _bodyShapes = new();
 
         public int BodyCount => BodyQ.Count;
         public int ShapeCount => ShapeType.Count;
@@ -137,14 +145,43 @@ namespace Vbd
             ShapeMaterialKe.Add(cfg.Ke);
             ShapeMaterialKd.Add(cfg.Kd);
             ShapeMaterialMu.Add(cfg.Mu);
+            ShapeCollisionGroup.Add(cfg.CollisionGroup);
+            var shape = ShapeCount - 1;
+            BodyShapes(body).Add(shape);
+
+            if (cfg.HasShapeCollision && cfg.CollisionFilterParent)
+            {
+                foreach (var pj in _jointParents.GetValueOrDefault(body, NoJoints))
+                    if (_jointCollisionFilterParent[pj.y]) FilterAgainstBody(shape, pj.x);
+                foreach (var cj in _jointChildren.GetValueOrDefault(body, NoJoints))
+                    if (_jointCollisionFilterParent[cj.y]) FilterAgainstBody(shape, cj.x);
+            }
 
             if (!isStatic && cfg.Density > 0f && body >= 0 && !BodyLockInertia[body])
             {
                 var props = Inertia.Shape(type, scale, cfg.Density, cfg.IsSolid, cfg.Margin);
                 UpdateBodyMass(body, props.Mass, props.Inertia, math.rotate(pose.Q, props.Com) + pose.P, pose.Q);
             }
-            return ShapeCount - 1;
+            return shape;
         }
+
+        static readonly List<int2> NoJoints = new();
+
+        List<int> BodyShapes(int body)
+        {
+            if (!_bodyShapes.TryGetValue(body, out var shapes)) _bodyShapes[body] = shapes = new List<int>();
+            return shapes;
+        }
+
+        // Filters `shape` against every shape of `body` that collides with shapes.
+        void FilterAgainstBody(int shape, int body)
+        {
+            foreach (var other in BodyShapes(body))
+                if ((ShapeFlagsList[other] & ShapeFlags.CollideShapes) != 0) AddShapeCollisionFilterPair(other, shape);
+        }
+
+        public void AddShapeCollisionFilterPair(int shapeA, int shapeB) =>
+            _shapeCollisionFilterPairs.Add(new int2(math.min(shapeA, shapeB), math.max(shapeA, shapeB)));
 
         public int AddShapeSphere(int body, Transform? xform = null, float radius = 1f, ShapeConfig cfg = null) =>
             AddShape(body, GeoType.Sphere, xform, cfg, new float3(radius, 0f, 0f));
@@ -222,6 +259,10 @@ namespace Vbd
             model.ShapeMaterialKe = ShapeMaterialKe.ToArray();
             model.ShapeMaterialKd = ShapeMaterialKd.ToArray();
             model.ShapeMaterialMu = ShapeMaterialMu.ToArray();
+            model.ShapeCollisionGroup = ShapeCollisionGroup.ToArray();
+            var filters = new HashSet<int2>(_shapeCollisionFilterPairs);
+            model.ShapeCollisionFilterPairs = new int2[filters.Count];
+            filters.CopyTo(model.ShapeCollisionFilterPairs);
         }
     }
 }
