@@ -10,10 +10,13 @@ Work in progress. Ported:
 * particle–shape contacts with sphere, capsule, box and plane shapes: penalty, damping, friction; shapes on
   dynamic bodies take the reaction, kinematic bodies push particles;
 * rigid bodies and joints (compliant-ALM AVBD): ball, fixed, revolute, prismatic, D6, free; drives and limits, kinematic bodies;
+* body–body contacts (compliant ALM with friction) between sphere, capsule, box and plane shapes: Newton's
+  explicit-pair broad phase, analytic pairs, MPR/GJK with a contact manifold for box–box and capsule–box;
+  collision groups, filter pairs, parent–child filtering of jointed bodies;
 * `ModelBuilder`: particles, soft grids and meshes, bodies, shapes, joints and articulations, graph coloring;
 * external forces: `State.BodyF` on bodies, `Control.JointF` on joints.
 
-Not yet: body–body contacts, particle–body attachments, edge/face contacts.
+Not yet: particle–body attachments, edge/face contacts, mesh/convex/SDF shapes, rigid contact history.
 
 ## Use
 

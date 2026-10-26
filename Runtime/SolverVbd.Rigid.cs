@@ -137,10 +137,10 @@ namespace Vbd
             _buffers.Add(Control.JointTargetQ);
             _buffers.Add(Control.JointTargetQd);
             _buffers.Add(Control.JointF);
-            var (forceJoints, forceOffsets) = ForceJoints(_model);
+            var (forceJoints, forceOffsets) = BuildForceJoints(_model);
             var forceAdj = Upload(forceJoints);
             var forceAdjOff = Upload(forceOffsets);
-            var jointWrench = Buffer<JointWrench>(_model.JointCount);
+            var jointWrench = Buffer<JointWrenchData>(_model.JointCount);
 
             foreach (var k in _rigidKernels)
             {
@@ -180,14 +180,14 @@ namespace Vbd
 
         // Per joint, apply_joint_forces' wrench on the child and the one taken from the parent, at their centers of mass.
         [StructLayout(LayoutKind.Sequential)]
-        struct JointWrench
+        struct JointWrenchData
         {
             public float3 ChildForce, ChildTorque, ParentForce, ParentTorque;
         }
 
         // Per body, the joints that pass Control.JointF to it, ascending as Newton's sequential accumulation: every
         // enabled joint but FIXED (apply_joint_forces skips it), FREE included; world endpoints left out.
-        static (int[] joints, int[] offsets) ForceJoints(Model model)
+        static (int[] joints, int[] offsets) BuildForceJoints(Model model)
         {
             var offsets = new int[model.BodyCount + 1];
             var lists = new List<int>[model.BodyCount];
@@ -226,7 +226,7 @@ namespace Vbd
                 {
                     Type = m.JointType[j], Parent = m.JointParent[j], Child = m.JointChild[j],
                     Enabled = m.JointEnabled[j] ? 1 : 0, QStart = m.JointQStart[j], QdStart = m.JointQdStart[j],
-                    LinCount = m.JointDofDim[j].x, AngCount = m.JointDofDim[j].y, Xp = m.JointXP[j], Xc = m.JointXC[j]
+                    LinCount = m.JointDofDim[j].x, AngCount = m.JointDofDim[j].y, Xp = m.JointXp[j], Xc = m.JointXc[j]
                 };
             return a;
         }
@@ -301,7 +301,7 @@ namespace Vbd
             cmd.SetBufferData(_rebaseline, RebaselineDone);
         }
 
-        partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, Contacts contacts, float dt)
+        partial void SolveRigidBodyIteration(CommandBuffer cmd, Contacts contacts, float dt)
         {
             if (_model.BodyCount == 0) return;
             for (var c = 0; c < _model.BodyColorCount; c++)
@@ -317,7 +317,7 @@ namespace Vbd
             if (_hasJointRows) cmd.DispatchCompute(_rigid, _updateDualsJoint, Groups(_model.JointCount), 1, 1);
         }
 
-        partial void FinalizeRigidBodies(CommandBuffer cmd, State state, float dt)
+        partial void FinalizeRigidBodies(CommandBuffer cmd)
         {
             if (_model.BodyCount == 0) return;
             cmd.DispatchCompute(_rigid, _updateBodyVelocity, Groups(_model.BodyCount), 1, 1);

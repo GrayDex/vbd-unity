@@ -130,8 +130,8 @@ namespace Vbd.Tests.Editor
             Assert.AreEqual(model.JointQ.Length, fx.Array<int>("joint_q_start")[joints], "joint coordinate count");
             Assert.AreEqual(model.JointDofCount, fx.Array<int>("joint_qd_start")[joints], "joint DOF count");
             AssertSame("joint_dof_dim", fx.Array<int>("joint_dof_dim"), MemoryMarshal.Cast<int2, int>(model.JointDofDim).ToArray());
-            AssertNear("joint_X_p", fx.Array<Transform>("joint_X_p"), model.JointXP);
-            AssertNear("joint_X_c", fx.Array<Transform>("joint_X_c"), model.JointXC);
+            AssertNear("joint_X_p", fx.Array<Transform>("joint_X_p"), model.JointXp);
+            AssertNear("joint_X_c", fx.Array<Transform>("joint_X_c"), model.JointXc);
             AssertNear("joint_axis", fx.Array<float3>("joint_axis"), model.JointAxis);
             AssertNear("joint_q", fx.Array<float>("joint_q"), model.JointQ);
             AssertNear("joint_qd", fx.Array<float>("joint_qd"), model.JointQd);

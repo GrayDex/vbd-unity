@@ -42,8 +42,8 @@ namespace Vbd
         public readonly List<int> JointType = new();
         public readonly List<int> JointParent = new();
         public readonly List<int> JointChild = new();
-        public readonly List<Transform> JointXP = new();
-        public readonly List<Transform> JointXC = new();
+        public readonly List<Transform> JointXp = new();
+        public readonly List<Transform> JointXc = new();
         public readonly List<int2> JointDofDim = new();
         public readonly List<bool> JointEnabled = new();
         public readonly List<int> JointArticulation = new();
@@ -110,8 +110,8 @@ namespace Vbd
             JointChild.Add(child);
             Append(_jointParents, child, new int2(parent, joint));
             Append(_jointChildren, parent, new int2(child, joint));
-            JointXP.Add(parentXform ?? Identity);
-            JointXC.Add(childXform ?? Identity);
+            JointXp.Add(parentXform ?? Identity);
+            JointXc.Add(childXform ?? Identity);
             JointDofDim.Add(new int2(linearAxes.Count, angularAxes.Count));
             JointEnabled.Add(enabled);
             JointArticulation.Add(-1);
@@ -281,8 +281,8 @@ namespace Vbd
         void InitJointQFromBodyPoses(int joint, int parent, int child)
         {
             var parentPose = parent == -1 ? Identity : BodyQ[parent];
-            var anchor = Mul(parentPose, JointXP[joint]);
-            var q = Mul(Mul(Inverse(anchor), BodyQ[child]), JointXC[joint]);
+            var anchor = Mul(parentPose, JointXp[joint]);
+            var q = Mul(Mul(Inverse(anchor), BodyQ[child]), JointXc[joint]);
             var s = JointQStart[joint];
             for (var k = 0; k < 3; k++) JointQ[s + k] = q.P[k];
             for (var k = 0; k < 4; k++) JointQ[s + 3 + k] = q.Q.value[k];
@@ -377,8 +377,8 @@ namespace Vbd
             model.JointEnabled = JointEnabled.ToArray();
             model.JointParent = JointParent.ToArray();
             model.JointChild = JointChild.ToArray();
-            model.JointXP = JointXP.ToArray();
-            model.JointXC = JointXC.ToArray();
+            model.JointXp = JointXp.ToArray();
+            model.JointXc = JointXc.ToArray();
             model.JointQStart = JointQStart.ToArray();
             model.JointQdStart = JointQdStart.ToArray();
             model.JointDofDim = JointDofDim.ToArray();

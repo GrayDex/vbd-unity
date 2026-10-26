@@ -22,8 +22,8 @@ namespace Vbd
         public int[] JointParent = { };
         public int[] JointChild = { };
         // Joint frame in the parent's and in the child's body frame.
-        public Transform[] JointXP = { };
-        public Transform[] JointXC = { };
+        public Transform[] JointXp = { };
+        public Transform[] JointXc = { };
         public int[] JointQStart = { };
         public int[] JointQdStart = { };
         // Linear and angular DOF counts; linear DOFs come first.
