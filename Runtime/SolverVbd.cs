@@ -23,6 +23,7 @@ namespace Vbd
             _model = model;
             Iterations = iterations;
             CreateParticles();
+            CreateContacts();
             CreateRigidBodies();
         }
 
@@ -31,10 +32,14 @@ namespace Vbd
         partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, float dt);
         partial void FinalizeRigidBodies(CommandBuffer cmd, State state, float dt);
 
-        public void Step(CommandBuffer cmd, State state, float dt)
+        public void Step(CommandBuffer cmd, State state, float dt) => Step(cmd, state, null, dt);
+
+        // `contacts` from CollisionPipeline.Collide on the same state, or null for none.
+        public void Step(CommandBuffer cmd, State state, Contacts contacts, float dt)
         {
             InitializeRigidBodies(cmd, state, dt);
             InitializeParticles(cmd, state, dt);
+            InitializeContacts(cmd, state, contacts);
             for (var iter = 0; iter < Iterations; iter++)
             {
                 SolveRigidBodyIteration(cmd, state, dt);
@@ -42,12 +47,14 @@ namespace Vbd
             }
             FinalizeRigidBodies(cmd, state, dt);
             FinalizeParticles(cmd);
+            FinalizeContacts(cmd, state);
         }
 
         public void Dispose()
         {
             foreach (var b in _buffers) b.Dispose();
             _buffers.Clear();
+            _noContacts.Dispose();
         }
 
         static int Groups(int threads, int perGroup = GroupSize) => (threads + perGroup - 1) / perGroup;

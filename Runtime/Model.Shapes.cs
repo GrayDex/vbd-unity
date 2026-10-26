@@ -30,7 +30,7 @@ namespace Vbd
 
         public float[] ParticleRadius = { };
         public float SoftContactKe = 1e3f;
-        public float SoftContactKd = 0f;
+        public float SoftContactKd = 10f;
         public float SoftContactMu = 0.5f;
 
         public int ShapeCount => ShapeType.Length;
