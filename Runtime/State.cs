@@ -10,6 +10,9 @@ namespace Vbd
         public readonly GraphicsBuffer ParticleQd;
         public readonly GraphicsBuffer BodyQ;
         public readonly GraphicsBuffer BodyQd;
+        // Newton's body_f: external force and torque per body (SpatialVelocity layout), world frame, torque about
+        // the center of mass. Zero at start; the step reads it and leaves it as is, the caller clears or rewrites it.
+        public readonly GraphicsBuffer BodyF;
 
         public State(Model model)
         {
@@ -17,6 +20,7 @@ namespace Vbd
             ParticleQd = Upload(model.ParticleQd, 12);
             BodyQ = Upload(model.BodyQ, 28);
             BodyQd = Upload(model.BodyQd, 24);
+            BodyF = Upload(new SpatialVelocity[model.BodyCount], 24);
         }
 
         public void Dispose()
@@ -25,6 +29,7 @@ namespace Vbd
             ParticleQd.Dispose();
             BodyQ.Dispose();
             BodyQd.Dispose();
+            BodyF.Dispose();
         }
 
         static GraphicsBuffer Upload<T>(T[] data, int stride) where T : struct
