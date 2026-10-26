@@ -5,7 +5,6 @@
 #pragma kernel UpdateVelocity
 #pragma kernel ClearContactHeads
 #pragma kernel InitBodyParticleContacts
-#pragma kernel SnapshotBodyQ
 
 #include "Transform.hlsl"
 
@@ -48,13 +47,12 @@ StructuredBuffer<float> _ShapeMaterialKe;
 StructuredBuffer<float> _ShapeMaterialKd;
 StructuredBuffer<float> _ShapeMaterialMu;
 RWStructuredBuffer<Xform> _BodyQ;
-RWStructuredBuffer<Xform> _BodyQPrev;
+StructuredBuffer<Xform> _BodyQPrev;
 
 int _ParticleCount;
 int _ColorStart;
 int _ColorSize;
 int _ContactMax;
-int _BodyCount;
 float _Dt;
 float3 _Gravity;
 float _SoftContactKe;
@@ -82,13 +80,6 @@ void InitBodyParticleContacts(uint3 id : SV_DispatchThreadID)
     int previous;
     InterlockedExchange(_ContactHead[_ContactParticle[i]], i, previous);
     _ContactNext[i] = previous;
-}
-
-// Body poses at the end of the step: the previous pose next step's contacts measure body motion from.
-[numthreads(64, 1, 1)]
-void SnapshotBodyQ(uint3 id : SV_DispatchThreadID)
-{
-    if ((int)id.x < _BodyCount) _BodyQPrev[id.x] = _BodyQ[id.x];
 }
 
 float3x3 Outer(float3 a, float3 b) { return float3x3(a * b.x, a * b.y, a * b.z); }

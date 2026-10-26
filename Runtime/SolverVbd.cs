@@ -17,11 +17,14 @@ namespace Vbd
 
         readonly Model _model;
         readonly List<GraphicsBuffer> _buffers = new();
+        // Newton's body_q_prev: body poses at the start of the step, written by the rigid part, read by joints and contacts.
+        readonly GraphicsBuffer _bodyQPrev;
 
         public SolverVbd(Model model, int iterations = 10)
         {
             _model = model;
             Iterations = iterations;
+            _bodyQPrev = Upload(model.BodyQ);
             CreateParticles();
             CreateContacts();
             CreateRigidBodies();
@@ -47,7 +50,6 @@ namespace Vbd
             }
             FinalizeRigidBodies(cmd, state, dt);
             FinalizeParticles(cmd);
-            FinalizeContacts(cmd, state);
         }
 
         public void Dispose()

@@ -28,7 +28,6 @@ namespace Vbd
             public static readonly int BodyQ = Shader.PropertyToID("_BodyQ");
             public static readonly int BodyQPrev = Shader.PropertyToID("_BodyQPrev");
             public static readonly int ContactMax = Shader.PropertyToID("_ContactMax");
-            public static readonly int BodyCount = Shader.PropertyToID("_BodyCount");
             public static readonly int SoftContactKe = Shader.PropertyToID("_SoftContactKe");
             public static readonly int SoftContactKd = Shader.PropertyToID("_SoftContactKd");
             public static readonly int SoftContactMu = Shader.PropertyToID("_SoftContactMu");
@@ -38,8 +37,8 @@ namespace Vbd
         // Slip speed [m/s] below which friction ramps linearly, as Newton's friction_epsilon.
         public float FrictionEpsilon = 1e-2f;
 
-        int _clearContactHeads, _initBodyParticleContacts, _snapshotBodyQ;
-        GraphicsBuffer _contactHead, _bodyQPrev;
+        int _clearContactHeads, _initBodyParticleContacts;
+        GraphicsBuffer _contactHead;
         GraphicsBuffer _contactNext, _contactMaterial;
         Contacts _noContacts;
 
@@ -47,9 +46,7 @@ namespace Vbd
         {
             _clearContactHeads = _particles.FindKernel("ClearContactHeads");
             _initBodyParticleContacts = _particles.FindKernel("InitBodyParticleContacts");
-            _snapshotBodyQ = _particles.FindKernel("SnapshotBodyQ");
             _contactHead = Buffer<int>(_model.ParticleCount);
-            _bodyQPrev = Upload(_model.BodyQ);
             _noContacts = new Contacts(1);
 
             var solve = _solveElasticity;
@@ -57,7 +54,6 @@ namespace Vbd
             _particles.SetBuffer(solve, ContactId.ShapeBody, Upload(_model.ShapeBody));
             _particles.SetBuffer(solve, ContactId.ShapeMargin, Upload(_model.ShapeMargin));
             _particles.SetBuffer(solve, ContactId.BodyQPrev, _bodyQPrev);
-            _particles.SetBuffer(_snapshotBodyQ, ContactId.BodyQPrev, _bodyQPrev);
             var init = _initBodyParticleContacts;
             _particles.SetBuffer(init, ContactId.ShapeMaterialKe, Upload(_model.ShapeMaterialKe));
             _particles.SetBuffer(init, ContactId.ShapeMaterialKd, Upload(_model.ShapeMaterialKd));
@@ -97,14 +93,6 @@ namespace Vbd
             cmd.DispatchCompute(_particles, _clearContactHeads, Groups(_model.ParticleCount), 1, 1);
             if (contacts == _noContacts) return;
             cmd.DispatchCompute(_particles, _initBodyParticleContacts, Groups(contacts.SoftContactMax), 1, 1);
-        }
-
-        void FinalizeContacts(CommandBuffer cmd, State state)
-        {
-            if (_model.BodyCount == 0) return;
-            cmd.SetComputeIntParam(_particles, ContactId.BodyCount, _model.BodyCount);
-            cmd.SetComputeBufferParam(_particles, _snapshotBodyQ, ContactId.BodyQ, state.BodyQ);
-            cmd.DispatchCompute(_particles, _snapshotBodyQ, Groups(_model.BodyCount), 1, 1);
         }
     }
 }

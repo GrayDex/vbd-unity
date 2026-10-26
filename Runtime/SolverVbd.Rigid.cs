@@ -110,7 +110,6 @@ namespace Vbd
             _rebaseline = Upload(new[] { 1 });
 
             var bodyQRest = Upload(_model.BodyQ);
-            var bodyQPrev = Upload(_model.BodyQ);
             var bodyInertiaQ = Buffer<Transform>(n);
             var bodyCom = Upload(_model.BodyCom);
             var bodyMass = Upload(_model.BodyMass);
@@ -136,7 +135,7 @@ namespace Vbd
 
             foreach (var k in _rigidKernels)
             {
-                _rigid.SetBuffer(k, RigidId.BodyQPrev, bodyQPrev);
+                _rigid.SetBuffer(k, RigidId.BodyQPrev, _bodyQPrev);
                 _rigid.SetBuffer(k, RigidId.BodyInertiaQ, bodyInertiaQ);
                 _rigid.SetBuffer(k, RigidId.JointState, jointState);
                 _rigid.SetBuffer(k, RigidId.DofState, dofState);
