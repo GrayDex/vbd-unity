@@ -2,8 +2,8 @@ using Unity.Mathematics;
 
 namespace Vbd
 {
-    // Newton's Model: everything the solver reads but never changes.
-    public sealed class Model
+    // Newton's Model: everything the solver reads but never changes. Particles and tetrahedra here, bodies in Model.Bodies.cs.
+    public sealed partial class Model
     {
         public const int ParticleActive = 1;
 
