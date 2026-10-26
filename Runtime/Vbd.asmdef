@@ -1,0 +1,7 @@
+{
+  "name": "Vbd",
+  "rootNamespace": "Vbd",
+  "references": ["Unity.Mathematics"],
+  "autoReferenced": true,
+  "noEngineReferences": false
+}

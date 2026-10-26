@@ -1,0 +1,182 @@
+// Particle VBD: Newton's forward_step, solve_elasticity (tiled, tetrahedra) and update_velocity.
+#pragma kernel ForwardStep
+#pragma kernel SolveElasticity
+#pragma kernel UpdateVelocity
+
+#define PARTICLE_ACTIVE 1
+// Threads per particle summing its adjacent tetrahedra, as Newton's TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE.
+#define TILE 16
+#define PARTICLES_PER_GROUP 4
+
+struct Mat33 { float3 r0; float3 r1; float3 r2; };
+
+RWStructuredBuffer<float3> _Q;
+RWStructuredBuffer<float3> _Qd;
+RWStructuredBuffer<float3> _QPrev;
+RWStructuredBuffer<float3> _Inertia;
+StructuredBuffer<float> _Mass;
+StructuredBuffer<int> _Flags;
+StructuredBuffer<int4> _TetIndices;
+StructuredBuffer<Mat33> _TetPoses;
+StructuredBuffer<float3> _TetMaterials;
+// Per particle: pairs (tet, vertex order in tet) from _AdjTetsOffsets[p] to _AdjTetsOffsets[p + 1].
+StructuredBuffer<int2> _AdjTets;
+StructuredBuffer<int> _AdjTetsOffsets;
+StructuredBuffer<int> _ColorParticles;
+
+int _ParticleCount;
+int _ColorStart;
+int _ColorSize;
+float _Dt;
+float3 _Gravity;
+
+bool IsDynamic(int p) { return (_Flags[p] & PARTICLE_ACTIVE) != 0 && _Mass[p] != 0.0; }
+
+[numthreads(64, 1, 1)]
+void ForwardStep(uint3 id : SV_DispatchThreadID)
+{
+    int p = (int)id.x;
+    if (p >= _ParticleCount) return;
+    float3 x = _Q[p];
+    _QPrev[p] = x;
+    if (!IsDynamic(p))
+    {
+        _Inertia[p] = x;
+        return;
+    }
+    float3 v = _Qd[p] + _Gravity * _Dt;
+    _Inertia[p] = x + v * _Dt;
+    _Q[p] = x + v * _Dt;
+}
+
+float3x3 FromCols(float3 a, float3 b, float3 c) { return transpose(float3x3(a, b, c)); }
+float3x3 Outer(float3 a, float3 b) { return float3x3(a * b.x, a * b.y, a * b.z); }
+
+// Stable Neo-Hookean force and 3×3 Hessian block of one tetrahedron on its vertex `order`
+// (Newton's evaluate_volumetric_neo_hookean_force_and_hessian), with damping on the rate of FᵀF.
+void TetForce(int tet, int order, out float3 force, out float3x3 hessian)
+{
+    int4 ti = _TetIndices[tet];
+    Mat33 pose = _TetPoses[tet];
+    float3x3 dmInv = float3x3(pose.r0, pose.r1, pose.r2);
+    float3 mat = _TetMaterials[tet];
+    float mu = mat.x, lmbd = mat.y, damping = mat.z;
+
+    float3 x0 = _Q[ti.x];
+    float3x3 F = mul(FromCols(_Q[ti.y] - x0, _Q[ti.z] - x0, _Q[ti.w] - x0), dmInv);
+    float3 f0 = float3(F[0][0], F[1][0], F[2][0]);
+    float3 f1 = float3(F[0][1], F[1][1], F[2][1]);
+    float3 f2 = float3(F[0][2], F[1][2], F[2][2]);
+    float restVolume = 1.0 / (determinant(dmInv) * 6.0);
+
+    // Smith et al. 2018: μ' = μ, λ' = λ + μ, α = 1 + μ'/λ'.
+    float lmbdNh = lmbd + mu;
+    float lmbdSafe = sign(lmbdNh) * max(abs(lmbdNh), 1e-6);
+    float alpha = 1.0 + mu / lmbdSafe;
+    float3 c0 = cross(f1, f2), c1 = cross(f2, f0), c2 = cross(f0, f1);
+    float J = dot(f0, c0);
+    float s = lmbdNh * (J - alpha);
+
+    // m: how this vertex moves F (row of Dm⁻¹; minus their sum for vertex 0).
+    float3 m = order == 0 ? -(dmInv[0] + dmInv[1] + dmInv[2]) : dmInv[order - 1];
+    float3 Fm = f0 * m.x + f1 * m.y + f2 * m.z;
+    float3 g = c0 * m.x + c1 * m.y + c2 * m.z;
+    force = -restVolume * (mu * Fm + s * g);
+    float3x3 I = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+    hessian = restVolume * (mu * dot(m, m) * I + lmbdNh * Outer(g, g));
+
+    if (damping > 0.0)
+    {
+        float invDt = 1.0 / _Dt;
+        float3 p0 = _QPrev[ti.x];
+        float3x3 Fp = mul(FromCols(_QPrev[ti.y] - p0, _QPrev[ti.z] - p0, _QPrev[ti.w] - p0), dmInv);
+        float3 p0c = float3(Fp[0][0], Fp[1][0], Fp[2][0]);
+        float3 p1c = float3(Fp[0][1], Fp[1][1], Fp[2][1]);
+        float3 p2c = float3(Fp[0][2], Fp[1][2], Fp[2][2]);
+        float r00 = (dot(f0, f0) - dot(p0c, p0c)) * invDt;
+        float r01 = (dot(f0, f1) - dot(p0c, p1c)) * invDt;
+        float r02 = (dot(f0, f2) - dot(p0c, p2c)) * invDt;
+        float r11 = (dot(f1, f1) - dot(p1c, p1c)) * invDt;
+        float r12 = (dot(f1, f2) - dot(p1c, p2c)) * invDt;
+        float r22 = (dot(f2, f2) - dot(p2c, p2c)) * invDt;
+        float3 d00 = 2.0 * m.x * f0;
+        float3 d01 = m.x * f1 + m.y * f0;
+        float3 d02 = m.x * f2 + m.z * f0;
+        float3 d11 = 2.0 * m.y * f1;
+        float3 d12 = m.y * f2 + m.z * f1;
+        float3 d22 = 2.0 * m.z * f2;
+        float3 fDamp = r00 * d00 + 2.0 * r01 * d01 + 2.0 * r02 * d02 + r11 * d11 + 2.0 * r12 * d12 + r22 * d22;
+        force -= restVolume * damping * fDamp;
+        hessian += restVolume * damping * invDt * (Outer(d00, d00) + 2.0 * Outer(d01, d01) + 2.0 * Outer(d02, d02)
+            + Outer(d11, d11) + 2.0 * Outer(d12, d12) + Outer(d22, d22));
+    }
+}
+
+float3x3 Inverse(float3x3 a, float det)
+{
+    float3 c0 = cross(a[1], a[2]), c1 = cross(a[2], a[0]), c2 = cross(a[0], a[1]);
+    return transpose(float3x3(c0, c1, c2)) / det;
+}
+
+groupshared float3 gsF[64];
+groupshared float3x3 gsH[64];
+
+// One Newton step of a particle at fixed neighbours: TILE threads sum its tetrahedra, the first applies it.
+[numthreads(64, 1, 1)]
+void SolveElasticity(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint lane = gi % TILE;
+    uint slot = gid.x * PARTICLES_PER_GROUP + gi / TILE;
+    bool valid = slot < (uint)_ColorSize;
+    int p = valid ? _ColorParticles[_ColorStart + slot] : 0;
+    bool dynamic = valid && IsDynamic(p);
+
+    float3 f = 0;
+    float3x3 h = 0;
+    if (dynamic)
+    {
+        int start = _AdjTetsOffsets[p], count = _AdjTetsOffsets[p + 1] - start;
+        for (int i = (int)lane; i < count; i += TILE)
+        {
+            int2 adj = _AdjTets[start + i];
+            float3 mat = _TetMaterials[adj.x];
+            if (mat.x > 0.0 || mat.y > 0.0)
+            {
+                float3 ft;
+                float3x3 ht;
+                TetForce(adj.x, adj.y, ft, ht);
+                f += ft;
+                h += ht;
+            }
+        }
+    }
+    gsF[gi] = f;
+    gsH[gi] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint stride = TILE / 2; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            gsF[gi] += gsF[gi + stride];
+            gsH[gi] += gsH[gi + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane != 0 || !dynamic) return;
+
+    float m = _Mass[p];
+    float invDt2 = 1.0 / (_Dt * _Dt);
+    float3 x = _Q[p];
+    f = gsF[gi] + m * (_Inertia[p] - x) * invDt2;
+    h = gsH[gi] + float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) * (m * invDt2);
+    float det = determinant(h);
+    if (abs(det) > 1e-8) _Q[p] = x + mul(Inverse(h, det), f);
+}
+
+[numthreads(64, 1, 1)]
+void UpdateVelocity(uint3 id : SV_DispatchThreadID)
+{
+    int p = (int)id.x;
+    if (p >= _ParticleCount) return;
+    _Qd[p] = (_Q[p] - _QPrev[p]) / _Dt;
+}
