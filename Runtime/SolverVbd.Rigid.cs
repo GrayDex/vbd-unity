@@ -231,6 +231,13 @@ namespace Vbd
             return a;
         }
 
+        // Warp's normalize in float32 with correctly rounded sqrt and division, done once here: the GPU's are not.
+        static float3 WarpNormalize(float3 a)
+        {
+            var l = MathF.Sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+            return l > 0f ? new float3(a.x / l, a.y / l, a.z / l) : float3.zero;
+        }
+
         DofData[] DofArray(float[] rest)
         {
             var m = _model;
@@ -238,7 +245,7 @@ namespace Vbd
             for (var d = 0; d < a.Length; d++)
                 a[d] = new DofData
                 {
-                    Axis = m.JointAxis[d], TargetKe = m.JointTargetKe[d], TargetKd = m.JointTargetKd[d],
+                    Axis = WarpNormalize(m.JointAxis[d]), TargetKe = m.JointTargetKe[d], TargetKd = m.JointTargetKd[d],
                     LimitLower = m.JointLimitLower[d], LimitUpper = m.JointLimitUpper[d],
                     LimitKe = m.JointLimitKe[d], LimitKd = m.JointLimitKd[d], RestAngle = rest[d]
                 };

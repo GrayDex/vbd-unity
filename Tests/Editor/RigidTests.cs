@@ -136,6 +136,8 @@ namespace Vbd.Tests.Editor
         [Test] public void KinematicChildFollowsNewton() => Run("kinematic_child", kinematic: true);
         [Test] public void FingerOnMovingPalmFollowsNewton() => Run("finger", kinematic: true);
         [Test] public void FreeSpinFollowsNewton() => Run("free_spin");
+        // An axis with several nonzero components: the GPU's inexact normalize let joint stiffness leak into the free rotation.
+        [Test] public void TiltedHingeFollowsNewton() => Run("tilted_hinge");
 
         [Test]
         public void AdjacencyExcludesFreeJointsAndWorld()

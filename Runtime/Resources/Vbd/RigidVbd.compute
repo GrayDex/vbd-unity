@@ -225,9 +225,9 @@ void ComputeJointKappaAndJacobian(int angStart, int angCount, float4 qwp, float4
         float3 coords;
         float3x3 covectors;
         EvalAngularCoordinates(angStart, angCount, qwp, qwc, coords, covectors);
-        float3 a0 = Normalize3(_Dofs[angStart].axis);
-        float3 a1 = Normalize3(_Dofs[angStart + 1].axis);
-        float3 a2 = angCount == 3 ? Normalize3(_Dofs[angStart + 2].axis) : cross(a0, a1);
+        float3 a0 = _Dofs[angStart].axis;
+        float3 a1 = _Dofs[angStart + 1].axis;
+        float3 a2 = angCount == 3 ? _Dofs[angStart + 2].axis : cross(a0, a1);
         float3x3 axes = FromCols(a0, a1, a2);
         kappa = mul(axes, coords);
         J = mul(transpose(covectors), transpose(axes));
@@ -257,7 +257,7 @@ void BuildJointProjectors(int jt, int qdStart, int linCount, int angCount, float
     }
     if (jt == JOINT_REVOLUTE)
     {
-        float3 a = Normalize3(_Dofs[qdStart].axis);
+        float3 a = _Dofs[qdStart].axis;
         pAng -= Outer(a, a);
     }
     else if (jt == JOINT_D6)
@@ -265,7 +265,7 @@ void BuildJointProjectors(int jt, int qdStart, int linCount, int angCount, float
         for (int k = 0; k < 3; k++)
             if (k < angCount)
             {
-                float3 a = Normalize3(_Dofs[qdStart + linCount + k].axis);
+                float3 a = _Dofs[qdStart + linCount + k].axis;
                 pAng -= Outer(a, a);
             }
     }
@@ -524,7 +524,7 @@ void EvaluateJoint(int body, int j, inout Wrench acc)
             DofData d = _Dofs[dof];
             bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
             if (!hasDrive && !hasLimits) continue;
-            float3 a = Normalize3(d.axis);
+            float3 a = d.axis;
             float theta = dot(kappa, a) + d.restAngle;
             DofState ds = _DofState[dof];
             if (angCount == 1) theta = UnwrapHingeAngle(theta, ds.anglePrev);
@@ -762,7 +762,7 @@ void StepJointC0LambdaRho(uint3 id : SV_DispatchThreadID)
         Transform Xwc = TMul(childPose, jd.xc), XwcRest = TMul(_BodyQRest[child], jd.xc);
         int dof = jd.qdStart + (jt == JOINT_D6 ? jd.linCount : 0);
         DofData d = _Dofs[dof];
-        float angle = dot(ComputeKappa(Xwp.q, Xwc.q, XwpRest.q, XwcRest.q), Normalize3(d.axis)) + d.restAngle;
+        float angle = dot(ComputeKappa(Xwp.q, Xwc.q, XwpRest.q, XwcRest.q), d.axis) + d.restAngle;
         DofState ds = _DofState[dof];
         float reference = _Rebaseline[0] != 0 ? d.restAngle : ds.anglePrev;
         ds.anglePrev = UnwrapHingeAngle(angle, reference);
@@ -826,7 +826,7 @@ void StepJointC0LambdaRho(uint3 id : SV_DispatchThreadID)
                 int dof = jd.qdStart + linCount + ai;
                 DofData d = _Dofs[dof];
                 if (!DriveApplies(d) && !LimitExists(d)) continue;
-                _DofState[dof].support = AngularAxisSupport(jd, parentPose, childPose, mul(J, Normalize3(d.axis)));
+                _DofState[dof].support = AngularAxisSupport(jd, parentPose, childPose, mul(J, d.axis));
             }
         }
     }
@@ -981,7 +981,7 @@ void UpdateDualsJoint(uint3 id : SV_DispatchThreadID)
             DofData d = _Dofs[dof];
             bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
             if (!hasDrive && !hasLimits) continue;
-            float3 a = Normalize3(d.axis);
+            float3 a = d.axis;
             DofState ds = _DofState[dof];
             float theta = dot(kappa, a) + d.restAngle;
             if (angCount == 1) theta = UnwrapHingeAngle(theta, ds.anglePrev);
