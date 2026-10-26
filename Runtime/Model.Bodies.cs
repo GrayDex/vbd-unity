@@ -27,6 +27,10 @@ namespace Vbd
 
     public sealed partial class Model
     {
+        // Newton's BodyFlags.KINEMATIC: the body is posed by the caller (State.BodyQ) and ignores forces.
+        public const int BodyKinematic = 1 << 1;
+
+        // Initial pose; for jointed bodies also the joints' rest pose, so it must agree with JointQ.
         public Transform[] BodyQ = { };
         public SpatialVelocity[] BodyQd = { };
         // Center of mass in the body frame.
@@ -36,6 +40,8 @@ namespace Vbd
         // Inertia about the center of mass, body frame.
         public float3x3[] BodyInertia = { };
         public float3x3[] BodyInvInertia = { };
+        // Empty means all dynamic.
+        public int[] BodyFlags = { };
 
         // Bodies grouped by color: no two bodies of one color share a joint.
         public int[] BodyColorBodies = { };

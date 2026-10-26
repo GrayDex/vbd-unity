@@ -1,0 +1,920 @@
+// Rigid AVBD, compliant-ALM path of Newton's SolverVBD (rigid_vbd_kernels.py): forward_step_rigid_bodies,
+// step_joint_C0_lambda_rho, solve_rigid_body, update_duals_joint, update_body_velocity.
+// Joints: BALL, FIXED, REVOLUTE, PRISMATIC, D6 (FREE has no rows). No contacts, rods, tendons, Dahl friction.
+#pragma kernel ForwardStepRigidBodies
+#pragma kernel StepJointC0LambdaRho
+#pragma kernel SolveRigidBody
+#pragma kernel UpdateDualsJoint
+#pragma kernel UpdateBodyVelocity
+
+#include "RigidVbdMath.hlsl"
+
+#define JOINT_PRISMATIC 0
+#define JOINT_REVOLUTE 1
+#define JOINT_BALL 2
+#define JOINT_FIXED 3
+#define JOINT_D6 6
+#define MAXVAL 1e10
+#define MODE_NONE 0
+#define MODE_LIMIT_LOWER 1
+#define MODE_LIMIT_UPPER 2
+#define MODE_DRIVE 3
+// Newton's _COMPLIANT_ALM_BILATERAL_MIN_RHO_OVER_K: rho ≥ 9K keeps k_eff ≥ 0.9K.
+#define MIN_RHO_OVER_K 9.0
+
+struct SpatialVelocity { float3 v; float3 w; };
+struct JointData
+{
+    int type; int parent; int child; int enabled;
+    int qStart; int qdStart; int linCount; int angCount;
+    Transform xp; Transform xc;
+};
+struct DofData { float3 axis; float targetKe; float targetKd; float limitLower; float limitUpper; float limitKe; float limitKd; float restAngle; };
+// Newton's joint_lambda_lin/ang, joint_C0_lin/ang and the structural joint_rho of slots 0 and 1.
+struct JointState { float3 lambdaLin; float3 lambdaAng; float3 c0Lin; float3 c0Ang; float rhoLin; float rhoAng; };
+// Newton's joint_drive_limit_support, joint_drive_lambda, joint_limit_lambda, joint_angle_prev.
+struct DofState { float support; float driveLambda; float limitLambda; float anglePrev; };
+
+RWStructuredBuffer<Transform> _BodyQ;
+RWStructuredBuffer<SpatialVelocity> _BodyQd;
+RWStructuredBuffer<Transform> _BodyQPrev;
+RWStructuredBuffer<Transform> _BodyInertiaQ;
+RWStructuredBuffer<JointState> _JointState;
+RWStructuredBuffer<DofState> _DofState;
+// Newton's pose rebaseline mask for the single world: set until the first step has consumed it.
+StructuredBuffer<int> _Rebaseline;
+StructuredBuffer<Transform> _BodyQRest;
+StructuredBuffer<float3> _BodyCom;
+StructuredBuffer<float> _BodyMass;
+StructuredBuffer<float> _BodyInvMass;
+StructuredBuffer<Mat33> _BodyInertia;
+StructuredBuffer<Mat33> _BodyInvInertia;
+StructuredBuffer<int> _ColorBodies;
+StructuredBuffer<int> _AdjJoints;
+StructuredBuffer<int> _AdjJointsOffsets;
+StructuredBuffer<JointData> _Joints;
+StructuredBuffer<DofData> _Dofs;
+StructuredBuffer<float> _TargetQ;
+StructuredBuffer<float> _TargetQd;
+
+int _BodyCount;
+int _JointCount;
+int _ColorStart;
+int _ColorSize;
+float _Dt;
+float3 _Gravity;
+float _LinearKe;
+float _AngularKe;
+float _LinearKd;
+float _AngularKd;
+float _Alpha;
+float _Retention;
+
+// ---- Compliant ALM coefficient algebra ----
+
+void AlmCoefficients(float k, float rho, out float s, out float keff, out float a)
+{
+    if (k <= 0.0 || rho <= 0.0)
+    {
+        s = 0.0; keff = 0.0; a = 1.0;
+        return;
+    }
+    if (k >= rho)
+    {
+        float r = rho / k;
+        s = 1.0 / (1.0 + r); keff = rho * s; a = r * s;
+        return;
+    }
+    float r = k / rho;
+    a = 1.0 / (1.0 + r); s = r * a; keff = k * a;
+}
+
+float AlmRelaxedAscent(float lam, float R, float k, float rho)
+{
+    float s, keff, a;
+    AlmCoefficients(k, rho, s, keff, a);
+    if (k >= rho) return lam + (keff * R - a * lam);
+    return s * lam + keff * R;
+}
+
+float3 AlmRelaxedAscent3(float3 lam, float3 R, float k, float rho)
+{
+    float s, keff, a;
+    AlmCoefficients(k, rho, s, keff, a);
+    if (k >= rho) return lam + (keff * R - a * lam);
+    return s * lam + keff * R;
+}
+
+float BilateralAutoRho(float support, float k) { return k <= 0.0 ? 0.0 : max(support, MIN_RHO_OVER_K * k); }
+float LimitAutoRho(float support, float k) { return (support <= 0.0 || k <= 0.0) ? 0.0 : support; }
+
+// Structural material stiffness of slot 0 (linear) and 1 (angular), as _init_joint_penalty_k.
+float MaterialLin(JointData jd)
+{
+    bool has = jd.type == JOINT_BALL || jd.type == JOINT_FIXED || jd.type == JOINT_REVOLUTE
+        || jd.type == JOINT_PRISMATIC || (jd.type == JOINT_D6 && jd.linCount < 3);
+    return has ? _LinearKe : 0.0;
+}
+
+float MaterialAng(JointData jd)
+{
+    bool has = jd.type == JOINT_FIXED || jd.type == JOINT_REVOLUTE || jd.type == JOINT_PRISMATIC
+        || (jd.type == JOINT_D6 && jd.angCount < 3);
+    return has ? _AngularKe : 0.0;
+}
+
+bool IsSupportedJoint(int t)
+{
+    return t == JOINT_BALL || t == JOINT_FIXED || t == JOINT_REVOLUTE || t == JOINT_PRISMATIC || t == JOINT_D6;
+}
+
+// Joint parent frame at the rest pose; the world for parent −1.
+Transform ParentRestFrame(JointData jd)
+{
+    if (jd.parent < 0) return jd.xp;
+    return TMul(_BodyQRest[jd.parent], jd.xp);
+}
+
+// Start-of-step pose: the previous pose for bodies the forward step has already moved, the current for the rest.
+Transform StartPose(int b)
+{
+    if (_BodyInvMass[b] > 0.0) return _BodyQPrev[b];
+    return _BodyQ[b];
+}
+
+Transform PrevPose(int b)
+{
+    if (b < 0) return TransformIdentity();
+    return _BodyQPrev[b];
+}
+
+// ---- Joint geometry: rotation-vector residual kappa and its Jacobian ----
+
+float3 ComputeKappa(float4 qwp, float4 qwc, float4 qwpRest, float4 qwcRest)
+{
+    float4 qAlign = QMul(QMul(QInverse(qwp), qwc), QInverse(QMul(QInverse(qwpRest), qwcRest)));
+    if (qAlign.w < 0.0) qAlign = -qAlign;
+    float3 axis;
+    float angle;
+    QToAxisAngle(qAlign, axis, angle);
+    return axis * angle;
+}
+
+void ComputeKappaAndJacobian(float4 qwp, float4 qwc, float4 qwpRest, float4 qwcRest, out float3 kappa, out float3x3 J)
+{
+    float4 qAlign = QMul(QMul(QInverse(qwp), qwc), QInverse(QMul(QInverse(qwpRest), qwcRest)));
+    if (qAlign.w < 0.0) qAlign = -qAlign;
+    float3 axis;
+    float angle;
+    QToAxisAngle(qAlign, axis, angle);
+    kappa = axis * angle;
+    // compute_right_jacobian_inverse with Newton's small-angle form.
+    float3x3 K = Skew(kappa);
+    float3x3 jrInv = Identity3() + 0.5 * K + (1.0 / 12.0) * mul(K, K);
+    J = mul(QToMatrix(qwp), mul(QToMatrix(qAlign), transpose(jrInv)));
+}
+
+// Newton's eval_angular_coordinates (with invert_3d_rotational_dofs, transform_3d_rotational_axes) for 2–3 axes.
+void EvalAngularCoordinates(int s, int count, float4 qp, float4 qc, out float3 coords, out float3x3 covectors)
+{
+    float3 axis0 = _Dofs[s].axis, axis1 = _Dofs[s + 1].axis, axis2;
+    if (count == 3) axis2 = _Dofs[s + 2].axis;
+    else
+    {
+        axis2 = axis1;
+        axis1 = cross(axis0, axis2);
+    }
+    float3 axis2Rh = cross(axis0, axis1);
+    float handed = dot(axis2Rh, axis2) < 0.0 ? -1.0 : 1.0;
+    float4 qOff = QFromMatrix(FromCols(axis0, axis1, axis2Rh));
+    float3 angles = QuatDecompose(QMul(QMul(QMul(QInverse(qOff), QInverse(qp)), qc), qOff));
+    coords = float3(angles.x, angles.y, handed * angles.z);
+
+    float4 q0 = QFromAxisAngle(axis0, coords.x);
+    float3 a1 = QRotate(q0, axis1);
+    float4 q1 = QFromAxisAngle(a1, coords.y);
+    float3 a2 = QRotate(QMul(q1, q0), axis2);
+    float3 a0 = QRotate(qp, axis0);
+    a1 = QRotate(qp, a1);
+    a2 = QRotate(qp, a2);
+    if (count == 2)
+    {
+        coords = float3(coords.x, coords.z, coords.y);
+        float3 locked = a1;
+        a1 = a2;
+        a2 = locked;
+    }
+    float det = dot(a0, cross(a1, a2));
+    float invDet = 1.0 / (WarpSign(det) * max(abs(det), 1.0e-4));
+    covectors = float3x3(cross(a1, a2), cross(a2, a0), cross(a0, a1)) * invDet;
+}
+
+// Newton's compute_joint_kappa_and_jacobian: D6 coordinates for 2–3 angular axes, plain kappa otherwise.
+void ComputeJointKappaAndJacobian(int angStart, int angCount, float4 qwp, float4 qwc, float4 qwpRest, float4 qwcRest,
+                                  out float3 kappa, out float3x3 J)
+{
+    if (angCount < 2) ComputeKappaAndJacobian(qwp, qwc, qwpRest, qwcRest, kappa, J);
+    else
+    {
+        float3 coords;
+        float3x3 covectors;
+        EvalAngularCoordinates(angStart, angCount, qwp, qwc, coords, covectors);
+        float3 a0 = Normalize3(_Dofs[angStart].axis);
+        float3 a1 = Normalize3(_Dofs[angStart + 1].axis);
+        float3 a2 = angCount == 3 ? Normalize3(_Dofs[angStart + 2].axis) : cross(a0, a1);
+        float3x3 axes = FromCols(a0, a1, a2);
+        kappa = mul(axes, coords);
+        J = mul(transpose(covectors), transpose(axes));
+    }
+}
+
+float3 ComputeKappaDot(float3x3 J, float3 omegaP, float3 omegaC) { return mul(transpose(J), omegaC - omegaP); }
+
+// Newton's build_joint_projectors: P = I − Σ aaᵀ over free axes (linear axes in world, angular in the parent frame).
+void BuildJointProjectors(int jt, int qdStart, int linCount, int angCount, float4 qwpRot, out float3x3 pLin, out float3x3 pAng)
+{
+    pLin = Identity3();
+    pAng = Identity3();
+    if (jt == JOINT_PRISMATIC)
+    {
+        float3 a = Normalize3(QRotate(qwpRot, _Dofs[qdStart].axis));
+        pLin -= Outer(a, a);
+    }
+    else if (jt == JOINT_D6)
+    {
+        for (int i = 0; i < 3; i++)
+            if (i < linCount)
+            {
+                float3 a = Normalize3(QRotate(qwpRot, _Dofs[qdStart + i].axis));
+                pLin -= Outer(a, a);
+            }
+    }
+    if (jt == JOINT_REVOLUTE)
+    {
+        float3 a = Normalize3(_Dofs[qdStart].axis);
+        pAng -= Outer(a, a);
+    }
+    else if (jt == JOINT_D6)
+    {
+        for (int k = 0; k < 3; k++)
+            if (k < angCount)
+            {
+                float3 a = Normalize3(_Dofs[qdStart + linCount + k].axis);
+                pAng -= Outer(a, a);
+            }
+    }
+}
+
+float UnwrapHingeAngle(float angle, float reference)
+{
+    return angle + 2.0 * PI_F * RoundHalfAway((reference - angle) / (2.0 * PI_F));
+}
+
+// ---- Structural rows (evaluate_linear/angular_constraint_force_hessian) ----
+
+struct Wrench { float3 f; float3 t; float3x3 hll; float3x3 hal; float3x3 haa; };
+
+Wrench ZeroWrench()
+{
+    Wrench w;
+    w.f = 0; w.t = 0; w.hll = 0; w.hal = 0; w.haa = 0;
+    return w;
+}
+
+Wrench AddWrench(Wrench a, Wrench b)
+{
+    a.f += b.f; a.t += b.t; a.hll += b.hll; a.hal += b.hal; a.haa += b.haa;
+    return a;
+}
+
+// A force and linear Hessian applied at offset r from the center of mass (_point_force_to_body_torque_and_hessian).
+Wrench PointForce(float3 r, float3 force, float3x3 hLinear)
+{
+    float3x3 rx = Skew(r);
+    Wrench w;
+    w.f = force;
+    w.t = cross(r, force);
+    w.hll = hLinear;
+    w.hal = mul(rx, hLinear);
+    w.haa = mul(mul(transpose(rx), hLinear), rx);
+    return w;
+}
+
+Wrench LinearConstraint(Transform Xwp, Transform Xwc, Transform XwpPrev, Transform XwcPrev, Transform parentPose,
+                        Transform childPose, float3 parentCom, float3 childCom, bool isParent, float rho, float materialK,
+                        float3x3 P, float3 lambda, float3 C0, float alpha, float damping)
+{
+    float3 r = isParent ? Xwp.p - TPoint(parentPose, parentCom) : Xwc.p - TPoint(childPose, childCom);
+    float3 C = Xwc.p - Xwp.p;
+    float3 cPerp = mul(P, C - alpha * C0);
+    float s, keff, a;
+    AlmCoefficients(materialK, rho, s, keff, a);
+    float3 fAttach = keff * cPerp + mul(P, lambda * s);
+    float3x3 kEff = keff * P;
+    if (damping > 0.0)
+    {
+        float invDt = 1.0 / _Dt;
+        float3 cPrev = XwcPrev.p - XwpPrev.p;
+        fAttach += damping * mul(P, (C - cPrev) * invDt);
+        kEff += (damping * invDt) * P;
+    }
+    return PointForce(r, isParent ? fAttach : -fAttach, kEff);
+}
+
+Wrench AngularConstraint(float4 qwp, float4 qwc, float3 kappa, float3x3 J, float4 qwpPrev, float4 qwcPrev, bool isParent,
+                         float rho, float materialK, float3x3 P, float3 lambda, float3 C0, float alpha, float damping)
+{
+    float s, keff, a;
+    AlmCoefficients(materialK, rho, s, keff, a);
+    float3 fLocal = keff * mul(P, kappa - alpha * C0) + mul(P, lambda * s);
+    float3x3 hLocal = keff * P;
+    if (damping > 0.0)
+    {
+        float3 dk = ComputeKappaDot(J, QuatVelocity(qwp, qwpPrev, _Dt), QuatVelocity(qwc, qwcPrev, _Dt));
+        fLocal += damping * mul(P, dk);
+        hLocal += (damping * (1.0 / _Dt)) * P;
+    }
+    Wrench w = ZeroWrench();
+    w.haa = mul(J, mul(hLocal, transpose(J)));
+    w.t = mul(J, fLocal);
+    if (!isParent) w.t = -w.t;
+    return w;
+}
+
+// ---- Drive and limit rows of one DOF (compliant ALM: drive and limit superpose) ----
+
+bool DriveApplies(DofData d) { return d.targetKe > 0.0 || d.targetKd > 0.0; }
+bool LimitExists(DofData d) { return d.limitKe > 0.0 && (d.limitLower > -MAXVAL || d.limitUpper < MAXVAL); }
+
+void SpringDamperStep(float error, float rateError, float k, float d, float invDt, out float rowError, out float rowK)
+{
+    rowK = k + d * invDt;
+    rowError = 0.0;
+    if (rowK <= 0.0)
+    {
+        rowK = 0.0;
+        return;
+    }
+    rowError = (k * error + d * rateError) / rowK;
+}
+
+// _resolve_active_drive_row on the compliant path: the drive target is clamped into the limits.
+float DriveError(DofData d, float q, float targetPos, bool hasLimits)
+{
+    float target = hasLimits ? clamp(targetPos, d.limitLower, d.limitUpper) : targetPos;
+    return q - target;
+}
+
+int NearestLimitBound(float q, float lower, float upper, bool hasLimits)
+{
+    if (!hasLimits) return MODE_NONE;
+    if (lower <= -MAXVAL) return MODE_LIMIT_UPPER;
+    if (upper >= MAXVAL) return MODE_LIMIT_LOWER;
+    return q - lower <= upper - q ? MODE_LIMIT_LOWER : MODE_LIMIT_UPPER;
+}
+
+// _eval_joint_axis_drive_limit: scalar force and Hessian along the DOF.
+void EvalAxisDriveLimit(DofData d, DofState ds, float targetPos, float targetVel, float q, float rate,
+                        bool hasDrive, bool hasLimits, out float f, out float h)
+{
+    float invDt = 1.0 / _Dt;
+    f = 0.0;
+    h = 0.0;
+    if (hasDrive && ds.support > 0.0)
+    {
+        float rowError, rowK;
+        SpringDamperStep(DriveError(d, q, targetPos, hasLimits), rate - targetVel, d.targetKe, d.targetKd, invDt, rowError, rowK);
+        if (rowK > 0.0)
+        {
+            float s, keff, a;
+            AlmCoefficients(rowK, BilateralAutoRho(ds.support, rowK), s, keff, a);
+            f += keff * rowError + s * ds.driveLambda;
+            h += keff;
+        }
+    }
+    int bound = NearestLimitBound(q, d.limitLower, d.limitUpper, hasLimits);
+    if (bound != MODE_NONE && d.limitKe > 0.0 && ds.support > 0.0)
+    {
+        float gap = bound == MODE_LIMIT_LOWER ? q - d.limitLower : q - d.limitUpper;
+        float rowError, rowK;
+        SpringDamperStep(gap, rate, d.limitKe, d.limitKd, invDt, rowError, rowK);
+        float s, keff, a;
+        AlmCoefficients(rowK, LimitAutoRho(ds.support, rowK), s, keff, a);
+        float force = keff * rowError + s * ds.limitLambda;
+        bool released = (bound == MODE_LIMIT_LOWER && force >= 0.0) || (bound == MODE_LIMIT_UPPER && force <= 0.0);
+        if (!released)
+        {
+            f += force;
+            h += keff;
+        }
+    }
+}
+
+// _update_joint_axis_drive_limit_state on the compliant path.
+DofState UpdateAxisDriveLimit(DofData d, DofState ds, float targetPos, float targetVel, float q, float rate,
+                              bool hasDrive, bool hasLimits)
+{
+    float invDt = 1.0 / _Dt;
+    float driveLambda = 0.0;
+    if (hasDrive && ds.support > 0.0)
+    {
+        float rowError, rowK;
+        SpringDamperStep(DriveError(d, q, targetPos, hasLimits), rate - targetVel, d.targetKe, d.targetKd, invDt, rowError, rowK);
+        if (rowK > 0.0) driveLambda = AlmRelaxedAscent(ds.driveLambda, rowError, rowK, BilateralAutoRho(ds.support, rowK));
+    }
+    float limitLambda = 0.0;
+    int bound = NearestLimitBound(q, d.limitLower, d.limitUpper, hasLimits);
+    if (bound != MODE_NONE && d.limitKe > 0.0 && ds.support > 0.0)
+    {
+        float gap = bound == MODE_LIMIT_LOWER ? q - d.limitLower : q - d.limitUpper;
+        float rowError, rowK;
+        SpringDamperStep(gap, rate, d.limitKe, d.limitKd, invDt, rowError, rowK);
+        float lam = AlmRelaxedAscent(ds.limitLambda, rowError, rowK, LimitAutoRho(ds.support, rowK));
+        limitLambda = bound == MODE_LIMIT_LOWER ? min(lam, 0.0) : max(lam, 0.0);
+    }
+    ds.driveLambda = driveLambda;
+    ds.limitLambda = limitLambda;
+    return ds;
+}
+
+Wrench AngularDriveLimit(float3 a, float3x3 J, bool isParent, float f, float h)
+{
+    float3 ja = mul(J, a);
+    Wrench w = ZeroWrench();
+    w.t = isParent ? f * ja : -f * ja;
+    w.haa = h * Outer(ja, ja);
+    return w;
+}
+
+Wrench LinearDriveLimit(float3 axisW, float3 r, bool isParent, float f, float h)
+{
+    float3 ra = cross(r, axisW);
+    Wrench w;
+    w.f = isParent ? f * axisW : -f * axisW;
+    w.t = cross(r, w.f);
+    w.hll = h * Outer(axisW, axisW);
+    w.hal = h * Outer(ra, axisW);
+    w.haa = h * Outer(ra, ra);
+    return w;
+}
+
+// ---- evaluate_joint_force_hessian: one joint's force and Hessian on one of its bodies ----
+
+void EvaluateJoint(int body, int j, inout Wrench acc)
+{
+    JointData jd = _Joints[j];
+    int jt = jd.type;
+    if (!IsSupportedJoint(jt) || jd.enabled == 0) return;
+    int parent = jd.parent, child = jd.child;
+    if (body != child && (parent < 0 || body != parent)) return;
+    bool isParent = parent >= 0 && body == parent;
+
+    Transform parentPose = TransformIdentity(), parentPosePrev = TransformIdentity();
+    float3 parentCom = 0;
+    if (parent >= 0)
+    {
+        parentPose = _BodyQ[parent];
+        parentPosePrev = _BodyQPrev[parent];
+        parentCom = _BodyCom[parent];
+    }
+    Transform childPose = _BodyQ[child], childPosePrev = _BodyQPrev[child];
+    float3 childCom = _BodyCom[child];
+    Transform Xwp = TMul(parentPose, jd.xp), Xwc = TMul(childPose, jd.xc);
+    Transform XwpPrev = TMul(parentPosePrev, jd.xp), XwcPrev = TMul(childPosePrev, jd.xc);
+    float4 qwp = Xwp.q, qwc = Xwc.q, qwpPrev = XwpPrev.q, qwcPrev = XwcPrev.q;
+    JointState js = _JointState[j];
+    float matLin = MaterialLin(jd), matAng = MaterialAng(jd);
+
+    if (jt == JOINT_BALL)
+    {
+        if (js.rhoLin > 0.0)
+            acc = AddWrench(acc, LinearConstraint(Xwp, Xwc, XwpPrev, XwcPrev, parentPose, childPose, parentCom, childCom, isParent,
+                                    js.rhoLin, matLin, Identity3(), js.lambdaLin, js.c0Lin, _Alpha, _LinearKd));
+        return;
+    }
+
+    Transform XwpRest = ParentRestFrame(jd);
+    float4 qwpRest = XwpRest.q, qwcRest = TMul(_BodyQRest[child], jd.xc).q;
+    int qd = jd.qdStart;
+    int linCount = jt == JOINT_D6 ? jd.linCount : (jt == JOINT_PRISMATIC ? 1 : 0);
+    int angCount = jt == JOINT_D6 ? jd.angCount : (jt == JOINT_REVOLUTE ? 1 : 0);
+    float3x3 pLin, pAng;
+    BuildJointProjectors(jt, qd, linCount, angCount, qwp, pLin, pAng);
+
+    Wrench total = ZeroWrench();
+    if (js.rhoLin > 0.0 && (jt != JOINT_D6 || linCount < 3))
+        total = AddWrench(total, LinearConstraint(Xwp, Xwc, XwpPrev, XwcPrev, parentPose, childPose, parentCom, childCom,
+                                                  isParent, js.rhoLin, matLin, pLin, js.lambdaLin, js.c0Lin, _Alpha, _LinearKd));
+
+    float3 kappa;
+    float3x3 J;
+    ComputeJointKappaAndJacobian(qd + linCount, jt == JOINT_D6 ? angCount : 0, qwp, qwc, qwpRest, qwcRest, kappa, J);
+    if (js.rhoAng > 0.0 && (jt != JOINT_D6 || angCount < 3))
+        total = AddWrench(total, AngularConstraint(qwp, qwc, kappa, J, qwpPrev, qwcPrev, isParent, js.rhoAng, matAng, pAng,
+                                                   js.lambdaAng, js.c0Ang, _Alpha, _AngularKd));
+    if (jt == JOINT_FIXED)
+    {
+        acc = AddWrench(acc, total);
+        return;
+    }
+
+    // Free DOFs: linear drives/limits measure the anchor offset along the world axis, angular ones kappa.
+    float invDt = 1.0 / _Dt;
+    float3 C = Xwc.p - Xwp.p;
+    float3 dC = (C - (XwcPrev.p - XwpPrev.p)) * invDt;
+    float3 r = isParent ? Xwp.p - TPoint(parentPose, parentCom) : Xwc.p - TPoint(childPose, childCom);
+    for (int li = 0; li < 3; li++)
+    {
+        if (li >= linCount) break;
+        int dof = qd + li;
+        DofData d = _Dofs[dof];
+        bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
+        if (!hasDrive && !hasLimits) continue;
+        float3 axisW = Normalize3(QRotate(qwp, d.axis));
+        float f, h;
+        EvalAxisDriveLimit(d, _DofState[dof], _TargetQ[jd.qStart + li], _TargetQd[dof], dot(C, axisW), dot(dC, axisW),
+                           hasDrive, hasLimits, f, h);
+        if (h > 0.0) total = AddWrench(total, LinearDriveLimit(axisW, r, isParent, f, h));
+    }
+    if (angCount > 0)
+    {
+        float3 dkappa = ComputeKappaDot(J, QuatVelocity(qwp, qwpPrev, _Dt), QuatVelocity(qwc, qwcPrev, _Dt));
+        for (int ai = 0; ai < 3; ai++)
+        {
+            if (ai >= angCount) break;
+            int dof = qd + linCount + ai;
+            DofData d = _Dofs[dof];
+            bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
+            if (!hasDrive && !hasLimits) continue;
+            float3 a = Normalize3(d.axis);
+            float theta = dot(kappa, a) + d.restAngle;
+            DofState ds = _DofState[dof];
+            if (angCount == 1) theta = UnwrapHingeAngle(theta, ds.anglePrev);
+            float f, h;
+            EvalAxisDriveLimit(d, ds, _TargetQ[jd.qStart + linCount + ai], _TargetQd[dof], theta, dot(dkappa, a),
+                               hasDrive, hasLimits, f, h);
+            if (h > 0.0) total = AddWrench(total, AngularDriveLimit(a, J, isParent, f, h));
+        }
+    }
+    acc = AddWrench(acc, total);
+}
+
+// ---- Kernels ----
+
+// forward_step_rigid_bodies with Newton's integrate_rigid_body (semi-implicit Euler, gyroscopic term, no damping).
+[numthreads(64, 1, 1)]
+void ForwardStepRigidBodies(uint3 id : SV_DispatchThreadID)
+{
+    int b = (int)id.x;
+    if (b >= _BodyCount) return;
+    Transform q = _BodyQ[b];
+    if (_Rebaseline[0] != 0) _BodyQPrev[b] = q;
+    float invM = _BodyInvMass[b];
+    if (invM == 0.0)
+    {
+        _BodyInertiaQ[b] = q;
+        return;
+    }
+    SpatialVelocity qd = _BodyQd[b];
+    float3 com = _BodyCom[b];
+    float3x3 I = Rows(_BodyInertia[b]);
+    float3x3 invI = Rows(_BodyInvInertia[b]);
+
+    float3 xCom = q.p + QRotate(q.q, com);
+    float3 v1 = qd.v + _Gravity * _Dt;
+    float3 x1 = xCom + v1 * _Dt;
+    float3 wb = QRotateInv(q.q, qd.w);
+    float3 tb = -cross(wb, mul(I, wb));
+    float3 w1 = QRotate(q.q, wb + mul(invI, tb) * _Dt);
+    float4 r1 = QNormalize(q.q + QMul(float4(w1, 0.0), q.q) * 0.5 * _Dt);
+
+    Transform qNew = MakeTransform(x1 - QRotate(r1, com), r1);
+    _BodyQ[b] = qNew;
+    qd.v = v1;
+    qd.w = w1;
+    _BodyQd[b] = qd;
+    _BodyInertiaQ[b] = qNew;
+}
+
+float LinearRhoSeed(int parent, int child)
+{
+    float invMEff = 0.0;
+    if (parent >= 0) invMEff += _BodyInvMass[parent];
+    if (child >= 0) invMEff += _BodyInvMass[child];
+    return invMEff > 0.0 ? 1.0 / (_Dt * _Dt) / invMEff : 0.0;
+}
+
+float AngularMobility(int b)
+{
+    if (b < 0 || _BodyInvMass[b] <= 0.0) return 0.0;
+    return Trace(Rows(_BodyInvInertia[b])) / 3.0;
+}
+
+float AngularRhoSeed(int parent, int child)
+{
+    float mobility = AngularMobility(parent) + AngularMobility(child);
+    return mobility > 0.0 ? 1.0 / (_Dt * _Dt) / mobility : 0.0;
+}
+
+float LinearAxisSupport(JointData jd, Transform parentPose, Transform childPose, float3 axisWorld)
+{
+    float w = 0.0;
+    if (jd.parent >= 0 && _BodyInvMass[jd.parent] > 0.0)
+    {
+        float3 moment = cross(jd.xp.p - _BodyCom[jd.parent], QRotateInv(parentPose.q, axisWorld));
+        w = _BodyInvMass[jd.parent] + dot(moment, mul(Rows(_BodyInvInertia[jd.parent]), moment));
+    }
+    if (jd.child >= 0 && _BodyInvMass[jd.child] > 0.0)
+    {
+        float3 moment = cross(jd.xc.p - _BodyCom[jd.child], QRotateInv(childPose.q, axisWorld));
+        w = w + _BodyInvMass[jd.child] + dot(moment, mul(Rows(_BodyInvInertia[jd.child]), moment));
+    }
+    return w > 0.0 ? 1.0 / (_Dt * _Dt) / w : 0.0;
+}
+
+float AngularAxisSupport(JointData jd, Transform parentPose, Transform childPose, float3 gradientWorld)
+{
+    float w = 0.0;
+    if (jd.parent >= 0 && _BodyInvMass[jd.parent] > 0.0)
+    {
+        float3 g = QRotateInv(parentPose.q, gradientWorld);
+        w = dot(g, mul(Rows(_BodyInvInertia[jd.parent]), g));
+    }
+    if (jd.child >= 0 && _BodyInvMass[jd.child] > 0.0)
+    {
+        float3 g = QRotateInv(childPose.q, gradientWorld);
+        w = w + dot(g, mul(Rows(_BodyInvInertia[jd.child]), g));
+    }
+    return w > 0.0 ? 1.0 / (_Dt * _Dt) / w : 0.0;
+}
+
+// step_joint_C0_lambda_rho: once per step, before the iterations. Hinge winding history, structural auto-rho,
+// drive/limit support with multiplier retention, C0 snapshot with lambda retention.
+[numthreads(64, 1, 1)]
+void StepJointC0LambdaRho(uint3 id : SV_DispatchThreadID)
+{
+    int j = (int)id.x;
+    if (j >= _JointCount) return;
+    JointData jd = _Joints[j];
+    int jt = jd.type, parent = jd.parent, child = jd.child;
+    bool enabled = jd.enabled != 0;
+    float matLin = MaterialLin(jd), matAng = MaterialAng(jd);
+    int cDim = jt == JOINT_BALL ? 1 : (jt == JOINT_FIXED ? 2 : (jt == JOINT_REVOLUTE || jt == JOINT_PRISMATIC ? 3
+        : (jt == JOINT_D6 ? 2 + jd.linCount + jd.angCount : 0)));
+
+    // 0. Winding of revolute and one-axis D6 joints; dynamic bodies use the start-of-step pose.
+    if ((jt == JOINT_REVOLUTE || (jt == JOINT_D6 && jd.angCount == 1)) && child >= 0)
+    {
+        Transform Xwp = jd.xp, XwpRest = jd.xp;
+        if (parent >= 0)
+        {
+            Transform parentPose = StartPose(parent);
+            Xwp = TMul(parentPose, Xwp);
+            XwpRest = TMul(_BodyQRest[parent], XwpRest);
+        }
+        Transform childPose = StartPose(child);
+        Transform Xwc = TMul(childPose, jd.xc), XwcRest = TMul(_BodyQRest[child], jd.xc);
+        int dof = jd.qdStart + (jt == JOINT_D6 ? jd.linCount : 0);
+        DofData d = _Dofs[dof];
+        float angle = dot(ComputeKappa(Xwp.q, Xwc.q, XwpRest.q, XwcRest.q), Normalize3(d.axis)) + d.restAngle;
+        DofState ds = _DofState[dof];
+        float reference = _Rebaseline[0] != 0 ? d.restAngle : ds.anglePrev;
+        ds.anglePrev = UnwrapHingeAngle(angle, reference);
+        _DofState[dof] = ds;
+    }
+
+    // 2. Structural auto-rho.
+    JointState js = _JointState[j];
+    if (cDim > 0 && child >= 0)
+    {
+        if (matLin > 0.0) js.rhoLin = BilateralAutoRho(LinearRhoSeed(parent, child), matLin);
+        if (cDim > 1 && matAng > 0.0) js.rhoAng = BilateralAutoRho(AngularRhoSeed(parent, child), matAng);
+    }
+
+    // 3. Drive/limit support of each free DOF and multiplier retention.
+    int linCount = jt == JOINT_PRISMATIC ? 1 : (jt == JOINT_D6 ? jd.linCount : 0);
+    int angCount = jt == JOINT_REVOLUTE ? 1 : (jt == JOINT_D6 ? jd.angCount : 0);
+    bool live = enabled && child >= 0;
+    bool hasMaterialRow = false, hasAngularRow = false;
+    for (int axis = 0; axis < linCount + angCount; axis++)
+    {
+        int dof = jd.qdStart + axis;
+        DofData d = _Dofs[dof];
+        DofState ds = _DofState[dof];
+        ds.support = 0.0;
+        if (DriveApplies(d) || LimitExists(d))
+        {
+            hasMaterialRow = true;
+            if (axis >= linCount) hasAngularRow = true;
+            ds.driveLambda = live ? _Retention * ds.driveLambda : 0.0;
+            ds.limitLambda = live ? _Retention * ds.limitLambda : 0.0;
+        }
+        else
+        {
+            ds.driveLambda = 0.0;
+            ds.limitLambda = 0.0;
+        }
+        _DofState[dof] = ds;
+    }
+    if (live && hasMaterialRow)
+    {
+        Transform parentPose = PrevPose(parent);
+        Transform childPose = _BodyQPrev[child];
+        float4 qwp = TMul(parentPose, jd.xp).q, qwc = TMul(childPose, jd.xc).q;
+        for (int li = 0; li < linCount; li++)
+        {
+            int dof = jd.qdStart + li;
+            DofData d = _Dofs[dof];
+            if (!DriveApplies(d) && !LimitExists(d)) continue;
+            _DofState[dof].support = LinearAxisSupport(jd, parentPose, childPose, Normalize3(QRotate(qwp, d.axis)));
+        }
+        if (hasAngularRow)
+        {
+            float4 qwpRest = ParentRestFrame(jd).q;
+            float4 qwcRest = TMul(_BodyQRest[child], jd.xc).q;
+            float3 kappa;
+            float3x3 J;
+            ComputeJointKappaAndJacobian(jd.qdStart + linCount, angCount, qwp, qwc, qwpRest, qwcRest, kappa, J);
+            for (int ai = 0; ai < angCount; ai++)
+            {
+                int dof = jd.qdStart + linCount + ai;
+                DofData d = _Dofs[dof];
+                if (!DriveApplies(d) && !LimitExists(d)) continue;
+                _DofState[dof].support = AngularAxisSupport(jd, parentPose, childPose, mul(J, Normalize3(d.axis)));
+            }
+        }
+    }
+
+    // 4. C0 snapshot and lambda retention for the structural rows.
+    bool hasLinear = matLin > 0.0, hasAngular = cDim > 1 && matAng > 0.0;
+    if (!enabled || cDim == 0 || child < 0 || (!hasLinear && !hasAngular))
+    {
+        js.lambdaLin = 0; js.lambdaAng = 0; js.c0Lin = 0; js.c0Ang = 0;
+        _JointState[j] = js;
+        return;
+    }
+    Transform Xwp = TMul(PrevPose(parent), jd.xp);
+    Transform Xwc = TMul(_BodyQPrev[child], jd.xc);
+    if (hasLinear)
+    {
+        js.c0Lin = Xwc.p - Xwp.p;
+        js.lambdaLin *= _Retention;
+    }
+    else
+    {
+        js.c0Lin = 0; js.lambdaLin = 0;
+    }
+    if (hasAngular)
+    {
+        float4 qwpRest = ParentRestFrame(jd).q;
+        float4 qwcRest = TMul(_BodyQRest[child], jd.xc).q;
+        float3 kappa;
+        float3x3 J;
+        ComputeJointKappaAndJacobian(jd.qdStart + jd.linCount, jt == JOINT_D6 ? jd.angCount : 0, Xwp.q, Xwc.q,
+                                     qwpRest, qwcRest, kappa, J);
+        js.c0Ang = kappa;
+        js.lambdaAng *= _Retention;
+    }
+    else
+    {
+        js.c0Ang = 0; js.lambdaAng = 0;
+    }
+    _JointState[j] = js;
+}
+
+// solve_rigid_body: one Newton step of a body against its inertial target and adjacent joints, one thread per body.
+[numthreads(64, 1, 1)]
+void SolveRigidBody(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _ColorSize) return;
+    int b = _ColorBodies[_ColorStart + (int)id.x];
+    if (_BodyInvMass[b] == 0.0) return;
+    float invDt2 = 1.0 / (_Dt * _Dt);
+    Transform q = _BodyQ[b], qStar = _BodyInertiaQ[b];
+    float3 com = _BodyCom[b];
+    float m = _BodyMass[b];
+    float3x3 I = Rows(_BodyInertia[b]);
+
+    float3 comCurrent = q.p + QRotate(q.q, com);
+    float3 comStar = qStar.p + QRotate(qStar.q, com);
+    float inertialCoeff = m * invDt2;
+    float4 dq = QMul(QInverse(q.q), qStar.q);
+    if (dq.w < 0.0) dq = -dq;
+    float3 axis;
+    float angle;
+    QToAxisAngle(dq, axis, angle);
+    float3x3 R = QToMatrix(q.q);
+    Wrench acc;
+    acc.f = (comStar - comCurrent) * inertialCoeff;
+    acc.t = QRotate(q.q, mul(I, (axis * angle) * invDt2));
+    acc.hll = Identity3() * inertialCoeff;
+    acc.hal = 0;
+    acc.haa = invDt2 * mul(mul(R, I), transpose(R));
+
+    int start = _AdjJointsOffsets[b], end = _AdjJointsOffsets[b + 1];
+    for (int k = start; k < end; k++) EvaluateJoint(b, _AdjJoints[k], acc);
+    float epsA = 1.0e-9 * (Trace(acc.haa) / 3.0 + 1.0);
+    acc.haa += Identity3() * epsA;
+
+    float3 dx, dw;
+    Ldlt6Solve(acc.hll, acc.haa, acc.hal, acc.f, acc.t, dx, dw);
+    // Small-angle quaternion update, as Newton's _USE_SMALL_ANGLE_APPROX.
+    float4 dqWorld = QNormalize(float4(dw * 0.5, 1.0));
+    float4 rotNew = QNormalize(QMul(dqWorld, q.q));
+    _BodyQ[b] = MakeTransform(comCurrent + dx - QRotate(rotNew, com), rotNew);
+}
+
+// update_duals_joint: compliant-ALM ascent of the structural and drive/limit multipliers after each iteration.
+[numthreads(64, 1, 1)]
+void UpdateDualsJoint(uint3 id : SV_DispatchThreadID)
+{
+    int j = (int)id.x;
+    if (j >= _JointCount) return;
+    JointData jd = _Joints[j];
+    int jt = jd.type, parent = jd.parent, child = jd.child;
+    if (jd.enabled == 0 || child < 0 || !IsSupportedJoint(jt)) return;
+
+    Transform Xwp = jd.xp, XwpPrev = jd.xp;
+    if (parent >= 0)
+    {
+        Xwp = TMul(_BodyQ[parent], jd.xp);
+        XwpPrev = TMul(_BodyQPrev[parent], jd.xp);
+    }
+    Transform Xwc = TMul(_BodyQ[child], jd.xc), XwcPrev = TMul(_BodyQPrev[child], jd.xc);
+    JointState js = _JointState[j];
+    float matLin = MaterialLin(jd), matAng = MaterialAng(jd);
+    float3 C = Xwc.p - Xwp.p;
+
+    if (jt == JOINT_BALL)
+    {
+        js.lambdaLin = AlmRelaxedAscent3(js.lambdaLin, C - _Alpha * js.c0Lin, matLin, js.rhoLin);
+        _JointState[j] = js;
+        return;
+    }
+
+    float4 qwp = Xwp.q, qwc = Xwc.q;
+    float4 qwpRest = ParentRestFrame(jd).q;
+    float4 qwcRest = TMul(_BodyQRest[child], jd.xc).q;
+    int qd = jd.qdStart;
+    int linCount = jt == JOINT_D6 ? jd.linCount : (jt == JOINT_PRISMATIC ? 1 : 0);
+    int angCount = jt == JOINT_D6 ? jd.angCount : (jt == JOINT_REVOLUTE ? 1 : 0);
+    float3x3 pLin, pAng;
+    BuildJointProjectors(jt, qd, linCount, angCount, qwp, pLin, pAng);
+    float3 kappa;
+    float3x3 J;
+    ComputeJointKappaAndJacobian(qd + linCount, jt == JOINT_D6 ? angCount : 0, qwp, qwc, qwpRest, qwcRest, kappa, J);
+
+    // FIXED and REVOLUTE keep lambda_lin unprojected (their P_lin is I); PRISMATIC keeps lambda_ang (P_ang is I).
+    if (jt != JOINT_D6 || linCount < 3)
+        js.lambdaLin = AlmRelaxedAscent3(mul(pLin, js.lambdaLin), mul(pLin, C) - _Alpha * mul(pLin, js.c0Lin), matLin, js.rhoLin);
+    if (jt != JOINT_D6 || angCount < 3)
+        js.lambdaAng = AlmRelaxedAscent3(mul(pAng, js.lambdaAng), mul(pAng, kappa) - _Alpha * mul(pAng, js.c0Ang), matAng, js.rhoAng);
+    _JointState[j] = js;
+    if (jt == JOINT_FIXED) return;
+
+    float3 dC = (C - (XwcPrev.p - XwpPrev.p)) / _Dt;
+    for (int li = 0; li < 3; li++)
+    {
+        if (li >= linCount) break;
+        int dof = qd + li;
+        DofData d = _Dofs[dof];
+        bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
+        if (!hasDrive && !hasLimits) continue;
+        float3 axisW = Normalize3(QRotate(qwp, d.axis));
+        _DofState[dof] = UpdateAxisDriveLimit(d, _DofState[dof], _TargetQ[jd.qStart + li], _TargetQd[dof],
+                                              dot(C, axisW), dot(dC, axisW), hasDrive, hasLimits);
+    }
+    if (angCount > 0)
+    {
+        float3 dkappa = ComputeKappaDot(J, QuatVelocity(qwp, XwpPrev.q, _Dt), QuatVelocity(qwc, XwcPrev.q, _Dt));
+        for (int ai = 0; ai < 3; ai++)
+        {
+            if (ai >= angCount) break;
+            int dof = qd + linCount + ai;
+            DofData d = _Dofs[dof];
+            bool hasDrive = DriveApplies(d), hasLimits = LimitExists(d);
+            if (!hasDrive && !hasLimits) continue;
+            float3 a = Normalize3(d.axis);
+            DofState ds = _DofState[dof];
+            float theta = dot(kappa, a) + d.restAngle;
+            if (angCount == 1) theta = UnwrapHingeAngle(theta, ds.anglePrev);
+            _DofState[dof] = UpdateAxisDriveLimit(d, ds, _TargetQ[jd.qStart + linCount + ai], _TargetQd[dof],
+                                                  theta, dot(dkappa, a), hasDrive, hasLimits);
+        }
+    }
+}
+
+// update_body_velocity: BDF1 velocities from the pose change, then the pose becomes the next step's previous pose.
+[numthreads(64, 1, 1)]
+void UpdateBodyVelocity(uint3 id : SV_DispatchThreadID)
+{
+    int b = (int)id.x;
+    if (b >= _BodyCount) return;
+    Transform pose = _BodyQ[b], prev = _BodyQPrev[b];
+    float3 com = _BodyCom[b];
+    SpatialVelocity qd;
+    qd.v = ((pose.p + QRotate(pose.q, com)) - (prev.p + QRotate(prev.q, com))) / _Dt;
+    qd.w = QuatVelocity(pose.q, prev.q, _Dt);
+    _BodyQd[b] = qd;
+    _BodyQPrev[b] = pose;
+}

@@ -19,5 +19,24 @@ namespace Vbd
                     pairs[fill[tets[tet][k]]++] = new int2(tet, k);
             return (pairs, offsets);
         }
+
+        // Per body, its constrained joints in ascending order, as Newton's _compute_rigid_force_element_adjacency:
+        // FREE joints and world endpoints are left out, disabled joints kept.
+        public static (int[] joints, int[] offsets) BodyJoints(Model model)
+        {
+            var offsets = new int[model.BodyCount + 1];
+            for (var j = 0; j < model.JointCount; j++)
+                if (model.JointType[j] != Model.JointFree)
+                    foreach (var b in new[] { model.JointParent[j], model.JointChild[j] })
+                        if (b >= 0) offsets[b + 1]++;
+            for (var b = 0; b < model.BodyCount; b++) offsets[b + 1] += offsets[b];
+            var fill = (int[])offsets.Clone();
+            var joints = new int[offsets[model.BodyCount]];
+            for (var j = 0; j < model.JointCount; j++)
+                if (model.JointType[j] != Model.JointFree)
+                    foreach (var b in new[] { model.JointParent[j], model.JointChild[j] })
+                        if (b >= 0) joints[fill[b]++] = j;
+            return (joints, offsets);
+        }
     }
 }
