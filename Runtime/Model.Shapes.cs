@@ -13,6 +13,7 @@ namespace Vbd
 
     public sealed partial class Model
     {
+        public const int ShapeCollideShapes = 1 << 1;
         public const int ShapeCollideParticles = 1 << 2;
 
         // Body each shape is attached to, -1 for the world.
@@ -27,6 +28,11 @@ namespace Vbd
         public float[] ShapeMaterialKe = { };
         public float[] ShapeMaterialKd = { };
         public float[] ShapeMaterialMu = { };
+        // Newton's shape_collision_group: a positive group collides with itself and negative groups, a negative one
+        // with every group but itself, 0 with none. Empty puts every shape in group 1, the builder's default.
+        public int[] ShapeCollisionGroup = { };
+        // Shape pairs, smaller index first, that never collide (Newton's shape_collision_filter_pairs).
+        public int2[] ShapeCollisionFilterPairs = { };
 
         public float[] ParticleRadius = { };
         public float SoftContactKe = 1e3f;

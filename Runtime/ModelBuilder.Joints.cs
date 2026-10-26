@@ -8,7 +8,7 @@ namespace Vbd
     // Joints and articulations: newton.ModelBuilder's add_joint and its typed forms for the joint types SolverVbd
     // solves (prismatic, revolute, ball, fixed, free, D6), add_articulation, add_body, and the joint part of finalize.
     // Left out because SolverVbd does not read them: armature, passive damping, friction, effort and velocity limits,
-    // actuator modes, labels, mimic joints, collision filtering between jointed shapes.
+    // actuator modes, labels, mimic joints.
     public sealed partial class ModelBuilder
     {
         // newton.ModelBuilder.JointDofConfig: one axis, its limits and drive, with Newton's defaults.
@@ -70,6 +70,8 @@ namespace Vbd
         // Per child body: (parent, joint); per parent body: (child, joint). Newton's joint_parents / joint_children.
         readonly Dictionary<int, List<int2>> _jointParents = new();
         readonly Dictionary<int, List<int2>> _jointChildren = new();
+        // Newton's joint_collision_filter_parent, per joint.
+        readonly List<bool> _jointCollisionFilterParent = new();
 
         public int JointCount => JointType.Count;
         public int JointDofCount => JointAxis.Count;
@@ -86,9 +88,11 @@ namespace Vbd
         }
 
         // add_joint: parent -1 is the world; axes are in the parent's joint frame, linear ones first.
+        // collisionFilterParent: no shape-shape contacts between parent and child; null is Newton's default, true but
+        // for non-fixed joints to the world.
         public int AddJoint(int jointType, int parent, int child, IReadOnlyList<JointDofConfig> linearAxes = null,
             IReadOnlyList<JointDofConfig> angularAxes = null, Transform? parentXform = null,
-            Transform? childXform = null, bool enabled = true)
+            Transform? childXform = null, bool enabled = true, bool? collisionFilterParent = null)
         {
             linearAxes ??= Array.Empty<JointDofConfig>();
             angularAxes ??= Array.Empty<JointDofConfig>();
@@ -111,6 +115,11 @@ namespace Vbd
             JointDofDim.Add(new int2(linearAxes.Count, angularAxes.Count));
             JointEnabled.Add(enabled);
             JointArticulation.Add(-1);
+            var filterParent = collisionFilterParent ?? (parent != -1 || jointType == Model.JointFixed);
+            _jointCollisionFilterParent.Add(filterParent);
+            if (filterParent)
+                foreach (var childShape in BodyShapes(child))
+                    if ((ShapeFlagsList[childShape] & ShapeFlags.CollideShapes) != 0) FilterAgainstBody(childShape, parent);
             foreach (var dof in linearAxes) AddAxis(dof);
             foreach (var dof in angularAxes) AddAxis(dof);
 
