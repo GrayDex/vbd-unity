@@ -58,7 +58,7 @@ namespace Vbd.Tests.Editor
         public void SoftGridMatchesNewton()
         {
             var fx = new Fixture("builder_grid");
-            var builder = new ModelBuilder();
+            var builder = new ModelBuilder { Gravity = fx.Array<float3>("gravity")[0] };
             builder.AddSoftGrid(new float3(0.5f, -1f, 2f), Quat(fx, "rot"), new float3(0.1f, 0f, -0.2f), new int3(5, 3, 2),
                 new float3(0.1f, 0.2f, 0.15f), 800f, 7e4f, 2e4f, 30f, fixLeft: true, fixBottom: true, particleRadius: 0.02f);
             var model = builder.Finalize();
@@ -166,7 +166,7 @@ namespace Vbd.Tests.Editor
         public void HangingGridBuiltByModelBuilderFollowsNewton()
         {
             var fx = new Fixture("hanging_grid");
-            var builder = new ModelBuilder();
+            var builder = new ModelBuilder { Gravity = fx.Array<float3>("gravity")[0] };
             builder.AddSoftGrid(new float3(0f, 0f, 1f), quaternion.identity, float3.zero, new int3(6, 2, 2),
                 new float3(fx.Value("cell")), fx.Value("density"), fx.Value("k_mu"), fx.Value("k_lambda"),
                 fx.Value("k_damp"), fixLeft: true);

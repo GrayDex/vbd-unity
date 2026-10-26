@@ -6,11 +6,11 @@ using UnityEngine;
 namespace Vbd
 {
     // Port of the part of newton.ModelBuilder that SolverVbd needs: particles, tetrahedra, rigid bodies and shapes
-    // (ModelBuilder.Rigid.cs), graph coloring and Finalize. Axes stay as given; the default gravity is Newton's, -Z.
+    // (ModelBuilder.Rigid.cs), graph coloring and Finalize. Axes stay as given; the default gravity is Unity's -Y (Newton's is -Z).
     // Joints are not here yet: Color takes the joint parent/child arrays instead.
     public sealed partial class ModelBuilder
     {
-        public float3 Gravity = new(0f, 0f, -9.81f);
+        public float3 Gravity = new(0f, -9.81f, 0f);
         public float DefaultParticleRadius = 0.1f;
         public float DefaultTetDensity = 1f;
         public float DefaultTetKMu = 1e3f;
