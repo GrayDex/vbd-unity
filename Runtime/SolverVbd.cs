@@ -19,6 +19,7 @@ namespace Vbd
         readonly List<GraphicsBuffer> _buffers = new();
         // Newton's body_q_prev: body poses at the start of the step, written by the rigid part, read by joints and contacts.
         readonly GraphicsBuffer _bodyQPrev;
+        internal GraphicsBuffer BodyQPrev => _bodyQPrev;
 
         public SolverVbd(Model model, int iterations = 10)
         {
@@ -28,13 +29,14 @@ namespace Vbd
             CreateParticles();
             CreateContacts();
             CreateRigidBodies();
+            CreateBodyContacts();
         }
 
         partial void CreateRigidBodies();
         partial void InitializeRigidBodies(CommandBuffer cmd, State state, float dt);
         partial void SolveRigidBodyIteration(CommandBuffer cmd, State state, Contacts contacts, float dt);
         // Per body color, before its solve: contact and attachment forces into the body scratch (Newton's accumulate_*_per_body).
-        partial void AccumulateBodyForces(CommandBuffer cmd, State state, Contacts contacts, int colorStart, int colorSize, float dt);
+        partial void AccumulateBodyForces(CommandBuffer cmd, Contacts contacts, int colorStart, int colorSize, float dt);
         partial void FinalizeRigidBodies(CommandBuffer cmd, State state, float dt);
 
         public void Step(CommandBuffer cmd, State state, float dt) => Step(cmd, state, null, dt);
@@ -45,6 +47,7 @@ namespace Vbd
             InitializeRigidBodies(cmd, state, dt);
             InitializeParticles(cmd, state, dt);
             InitializeContacts(cmd, state, contacts);
+            InitializeBodyContacts(cmd, state, contacts);
             for (var iter = 0; iter < Iterations; iter++)
             {
                 SolveRigidBodyIteration(cmd, state, contacts, dt);

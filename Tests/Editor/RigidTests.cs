@@ -12,7 +12,7 @@ namespace Vbd.Tests.Editor
         const float PositionTolerance = 1e-4f;
         const double RotationToleranceDeg = 0.01;
 
-        static Model ModelFrom(Fixture fx)
+        internal static Model ModelFrom(Fixture fx)
         {
             var joints = fx.Shape("joint_type")[0];
             return new Model

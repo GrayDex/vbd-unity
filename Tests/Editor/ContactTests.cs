@@ -7,7 +7,7 @@ namespace Vbd.Tests.Editor
     // Particle-shape contacts against Newton's CollisionPipeline + SolverVBD.
     public class ContactTests
     {
-        static Model ModelFrom(Fixture fx) => new()
+        internal static Model ModelFrom(Fixture fx) => new()
         {
             Gravity = fx.Array<float3>("gravity")[0],
             ParticleQ = fx.Array<float3>("particle_q"),

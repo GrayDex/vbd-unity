@@ -1,0 +1,82 @@
+// Body-particle contacts, body side: Newton's build_body_particle_contact_lists and
+// accumulate_body_particle_contacts_per_body — every particle contact pushes its dynamic body back.
+#pragma kernel ClearBodyContactHeads
+#pragma kernel BuildBodyContactLists
+#pragma kernel AccumulateBodyParticleContacts
+
+#include "RigidWrench.hlsl"
+#include "ContactForce.hlsl"
+
+StructuredBuffer<float3> _ParticleQ;
+StructuredBuffer<float3> _ParticleQPrev;
+StructuredBuffer<float> _ParticleRadius;
+StructuredBuffer<uint> _ContactCount;
+StructuredBuffer<int> _ContactParticle;
+StructuredBuffer<int> _ContactShape;
+StructuredBuffer<float3> _ContactBodyPos;
+StructuredBuffer<float3> _ContactBodyVel;
+StructuredBuffer<float3> _ContactNormal;
+StructuredBuffer<float3> _ContactMaterial;
+StructuredBuffer<int> _ShapeBody;
+StructuredBuffer<float> _ShapeMargin;
+StructuredBuffer<Transform> _BodyQ;
+StructuredBuffer<Transform> _BodyQPrev;
+StructuredBuffer<float3> _BodyCom;
+StructuredBuffer<float> _BodyInvMass;
+StructuredBuffer<int> _ColorBodies;
+// Per body, a linked list of its contacts: head per body, next per contact, -1 ends.
+RWStructuredBuffer<int> _BodyContactHead;
+RWStructuredBuffer<int> _BodyContactNext;
+RWStructuredBuffer<Wrench> _BodyForces;
+
+int _BodyCount;
+int _ContactMax;
+int _ColorStart;
+int _ColorSize;
+float _Dt;
+float _FrictionEpsilon;
+
+[numthreads(64, 1, 1)]
+void ClearBodyContactHeads(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _BodyCount) _BodyContactHead[id.x] = -1;
+}
+
+// Only dynamic bodies are listed: kinematic and static ones are never moved by the solve.
+[numthreads(64, 1, 1)]
+void BuildBodyContactLists(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ContactMax || i >= (int)_ContactCount[0]) return;
+    int body = _ShapeBody[_ContactShape[i]];
+    if (body < 0 || _BodyInvMass[body] <= 0.0) return;
+    int previous;
+    InterlockedExchange(_BodyContactHead[body], i, previous);
+    _BodyContactNext[i] = previous;
+}
+
+// One thread per body of the color; the body's total replaces last iteration's.
+[numthreads(64, 1, 1)]
+void AccumulateBodyParticleContacts(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _ColorSize) return;
+    int b = _ColorBodies[_ColorStart + (int)id.x];
+    Wrench acc = ZeroWrench();
+    Transform X = _BodyQ[b], Xprev = _BodyQPrev[b];
+    float3 comWorld = TPoint(X, _BodyCom[b]);
+    for (int c = _BodyContactHead[b]; c >= 0; c = _BodyContactNext[c])
+    {
+        int p = _ContactParticle[c];
+        float3 x = _ParticleQ[p];
+        float3 local = _ContactBodyPos[c];
+        float3 cp = TPoint(X, local);
+        float3 n = _ContactNormal[c];
+        float3 bv = (cp - TPoint(Xprev, local)) / _Dt + QRotate(X.q, _ContactBodyVel[c]);
+        float3 f;
+        float3x3 h;
+        BodyParticleContactForce(dot(n, x - cp), _ParticleRadius[p] + _ShapeMargin[_ContactShape[c]], n,
+                                 x - _ParticleQPrev[p] - bv * _Dt, _ContactMaterial[c], _FrictionEpsilon, _Dt, f, h);
+        acc = AddWrench(acc, PointForce(cp - comWorld, -f, h));
+    }
+    _BodyForces[b] = acc;
+}

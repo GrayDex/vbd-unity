@@ -32,6 +32,8 @@ namespace Vbd
 
         ComputeShader _particles;
         int _forwardStep, _solveElasticity, _updateVelocity;
+        // Newton's particle_q_prev: positions at the start of the step.
+        GraphicsBuffer _particleQPrev;
 
         void CreateParticles()
         {
@@ -41,7 +43,7 @@ namespace Vbd
             _updateVelocity = _particles.FindKernel("UpdateVelocity");
 
             var n = _model.ParticleCount;
-            var qPrev = Buffer<float3>(n);
+            _particleQPrev = Buffer<float3>(n);
             var inertia = Buffer<float3>(n);
             var (adjPairs, adjOffsets) = Adjacency.VertexTets(_model.TetIndices, n);
             // Rows of Dm⁻¹: Unity.Mathematics stores matrices by column.
@@ -50,7 +52,7 @@ namespace Vbd
 
             foreach (var k in new[] { _forwardStep, _solveElasticity, _updateVelocity })
             {
-                _particles.SetBuffer(k, ParticleId.QPrev, qPrev);
+                _particles.SetBuffer(k, ParticleId.QPrev, _particleQPrev);
                 _particles.SetBuffer(k, ParticleId.Inertia, inertia);
                 _particles.SetBuffer(k, ParticleId.Mass, Upload(_model.ParticleMass));
                 _particles.SetBuffer(k, ParticleId.Flags, Upload(_model.ParticleFlags));

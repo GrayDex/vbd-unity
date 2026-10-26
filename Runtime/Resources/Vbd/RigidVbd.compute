@@ -8,6 +8,7 @@
 #pragma kernel UpdateBodyVelocity
 
 #include "RigidVbdMath.hlsl"
+#include "RigidWrench.hlsl"
 
 #define JOINT_PRISMATIC 0
 #define JOINT_REVOLUTE 1
@@ -56,6 +57,9 @@ StructuredBuffer<JointData> _Joints;
 StructuredBuffer<DofData> _Dofs;
 StructuredBuffer<float> _TargetQ;
 StructuredBuffer<float> _TargetQd;
+// Per body, contact forces gathered before its solve in this iteration (BodyContacts.compute); read if _HasBodyForces.
+StructuredBuffer<Wrench> _BodyForces;
+int _HasBodyForces;
 
 int _BodyCount;
 int _JointCount;
@@ -271,34 +275,6 @@ float UnwrapHingeAngle(float angle, float reference)
 }
 
 // ---- Structural rows (evaluate_linear/angular_constraint_force_hessian) ----
-
-struct Wrench { float3 f; float3 t; float3x3 hll; float3x3 hal; float3x3 haa; };
-
-Wrench ZeroWrench()
-{
-    Wrench w;
-    w.f = 0; w.t = 0; w.hll = 0; w.hal = 0; w.haa = 0;
-    return w;
-}
-
-Wrench AddWrench(Wrench a, Wrench b)
-{
-    a.f += b.f; a.t += b.t; a.hll += b.hll; a.hal += b.hal; a.haa += b.haa;
-    return a;
-}
-
-// A force and linear Hessian applied at offset r from the center of mass (_point_force_to_body_torque_and_hessian).
-Wrench PointForce(float3 r, float3 force, float3x3 hLinear)
-{
-    float3x3 rx = Skew(r);
-    Wrench w;
-    w.f = force;
-    w.t = cross(r, force);
-    w.hll = hLinear;
-    w.hal = mul(rx, hLinear);
-    w.haa = mul(mul(transpose(rx), hLinear), rx);
-    return w;
-}
 
 Wrench LinearConstraint(Transform Xwp, Transform Xwc, Transform XwpPrev, Transform XwcPrev, Transform parentPose,
                         Transform childPose, float3 parentCom, float3 childCom, bool isParent, float rho, float materialK,
@@ -810,6 +786,7 @@ void SolveRigidBody(uint3 id : SV_DispatchThreadID)
     acc.hll = Identity3() * inertialCoeff;
     acc.hal = 0;
     acc.haa = invDt2 * mul(mul(R, I), transpose(R));
+    if (_HasBodyForces != 0) acc = AddWrench(acc, _BodyForces[b]);
 
     int start = _AdjJointsOffsets[b], end = _AdjJointsOffsets[b + 1];
     for (int k = start; k < end; k++) EvaluateJoint(b, _AdjJoints[k], acc);

@@ -7,6 +7,7 @@
 #pragma kernel InitBodyParticleContacts
 
 #include "Transform.hlsl"
+#include "ContactForce.hlsl"
 
 #define PARTICLE_ACTIVE 1
 // Threads per particle summing its adjacent tetrahedra, as Newton's TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE.
@@ -84,47 +85,22 @@ void InitBodyParticleContacts(uint3 id : SV_DispatchThreadID)
 
 float3x3 Outer(float3 a, float3 b) { return float3x3(a * b.x, a * b.y, a * b.z); }
 
-// Newton's _eval_body_particle_contact → _compute_body_particle_contact_force: quadratic penalty
-// (no log barrier), damping while approaching, regularized isotropic Coulomb friction.
+// Newton's _eval_body_particle_contact: the contact geometry at the current body pose, then the shared force law.
 void ContactForce(int p, int c, float3 x, out float3 force, out float3x3 hessian)
 {
-    force = 0;
-    hessian = 0;
     int shape = _ContactShape[c];
     int body = _ShapeBody[shape];
-    Xform X = XformIdentity();
-    if (body >= 0) X = _BodyQ[body];
+    Xform X = XformIdentity(), Xprev = XformIdentity();
+    if (body >= 0)
+    {
+        X = _BodyQ[body];
+        Xprev = _BodyQPrev[body];
+    }
     float3 bx = XformPoint(X, _ContactBodyPos[c]);
     float3 n = _ContactNormal[c];
-    float distance = dot(n, x - bx);
-    float penetration = _ParticleRadius[p] + _ShapeMargin[shape] - distance;
-    if (penetration <= 0.0) return;
-
-    Xform Xprev = XformIdentity();
-    if (body >= 0) Xprev = _BodyQPrev[body];
     float3 bv = (bx - XformPoint(Xprev, _ContactBodyPos[c])) / _Dt + XformVector(X, _ContactBodyVel[c]);
-    float3 u = x - _QPrev[p] - bv * _Dt;
-    float3 mat = _ContactMaterial[c];
-    float fn = mat.x * penetration;
-    float3x3 nn = Outer(n, n);
-    force = n * fn;
-    hessian = mat.x * nn;
-    if (dot(n, u) < 0.0)
-    {
-        float3x3 damping = (mat.y / _Dt) * nn;
-        hessian += damping;
-        force -= mul(damping, u);
-    }
-    float3 ut = u - n * dot(n, u);
-    float uNorm = length(ut);
-    if (uNorm > 0.0)
-    {
-        float eps = _FrictionEpsilon * _Dt;
-        float scale = uNorm > eps ? 1.0 / uNorm : eps > 0.0 ? (-uNorm / eps + 2.0) / eps : 0.0;
-        scale *= mat.z * fn;
-        force -= scale * ut;
-        hessian += scale * (float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) - nn);
-    }
+    BodyParticleContactForce(dot(n, x - bx), _ParticleRadius[p] + _ShapeMargin[shape], n, x - _QPrev[p] - bv * _Dt,
+                             _ContactMaterial[c], _FrictionEpsilon, _Dt, force, hessian);
 }
 
 [numthreads(64, 1, 1)]

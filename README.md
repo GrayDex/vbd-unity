@@ -7,12 +7,12 @@ A compute-shader port of NVIDIA [Newton](https://github.com/newton-physics/newto
 Work in progress. Ported:
 
 * particles and tetrahedra (VBD, graph-colored Gauss–Seidel);
-* particle–shape contacts with sphere, capsule, box and plane shapes: penalty, damping, friction;
+* particle–shape contacts with sphere, capsule, box and plane shapes: penalty, damping, friction; shapes on
+  dynamic bodies take the reaction, kinematic bodies push particles;
 * rigid bodies and joints (compliant-ALM AVBD): ball, fixed, revolute, prismatic, D6, free; drives and limits, kinematic bodies;
 * `ModelBuilder`: particles, soft grids and meshes, bodies, shapes, graph coloring.
 
-Not yet: the contact reaction on bodies (particles do not push bodies back; contacts are checked against Newton
-with world shapes only), particle–body attachments, edge/face contacts,
+Not yet: body–body contacts, particle–body attachments, edge/face contacts,
 joints in `ModelBuilder`, external body and joint forces.
 
 ## Use

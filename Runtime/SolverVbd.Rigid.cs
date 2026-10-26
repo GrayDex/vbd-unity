@@ -7,7 +7,7 @@ using UnityEngine.Rendering;
 namespace Vbd
 {
     // Rigid bodies and joints: Newton's _initialize_rigid_bodies, _solve_rigid_body_iteration, _finalize_rigid_bodies
-    // on the compliant-ALM path (Newton's default). No contacts yet.
+    // on the compliant-ALM path (Newton's default). Contact reactions on bodies come in through AccumulateBodyForces.
     public sealed partial class SolverVbd
     {
         // Newton's SolverVBD constructor arguments with its defaults; read at every step.
@@ -77,6 +77,7 @@ namespace Vbd
         int _forwardStepRigid, _stepJoint, _solveRigid, _updateDualsJoint, _updateBodyVelocity;
         int[] _rigidKernels;
         GraphicsBuffer _rebaseline;
+        GraphicsBuffer _bodyInvMassEffective;
         bool _hasJointRows;
 
         partial void CreateRigidBodies()
@@ -113,7 +114,7 @@ namespace Vbd
             var bodyInertiaQ = Buffer<Transform>(n);
             var bodyCom = Upload(_model.BodyCom);
             var bodyMass = Upload(_model.BodyMass);
-            var bodyInvMass = Upload(invMass);
+            _bodyInvMassEffective = Upload(invMass);
             var bodyInertia = Upload(inertiaRows);
             var bodyInvInertia = Upload(invInertiaRows);
             var colorBodies = Upload(_model.BodyColorBodies);
@@ -143,7 +144,7 @@ namespace Vbd
                 _rigid.SetBuffer(k, RigidId.BodyQRest, bodyQRest);
                 _rigid.SetBuffer(k, RigidId.BodyCom, bodyCom);
                 _rigid.SetBuffer(k, RigidId.BodyMass, bodyMass);
-                _rigid.SetBuffer(k, RigidId.BodyInvMass, bodyInvMass);
+                _rigid.SetBuffer(k, RigidId.BodyInvMass, _bodyInvMassEffective);
                 _rigid.SetBuffer(k, RigidId.BodyInertia, bodyInertia);
                 _rigid.SetBuffer(k, RigidId.BodyInvInertia, bodyInvInertia);
                 _rigid.SetBuffer(k, RigidId.ColorBodies, colorBodies);
@@ -248,7 +249,7 @@ namespace Vbd
                 if (size == 0) continue;
                 cmd.SetComputeIntParam(_rigid, RigidId.ColorStart, start);
                 cmd.SetComputeIntParam(_rigid, RigidId.ColorSize, size);
-                AccumulateBodyForces(cmd, state, contacts, start, size, dt);
+                AccumulateBodyForces(cmd, contacts, start, size, dt);
                 cmd.DispatchCompute(_rigid, _solveRigid, Groups(size), 1, 1);
             }
             if (_hasJointRows) cmd.DispatchCompute(_rigid, _updateDualsJoint, Groups(_model.JointCount), 1, 1);
