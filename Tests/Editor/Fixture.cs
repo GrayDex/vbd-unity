@@ -15,7 +15,7 @@ namespace Vbd.Tests.Editor
         [Serializable] class Entry { public string name; public string dtype; public int[] shape; public int offset; }
         [Serializable] class Header { public string scene; public Param[] @params; public Entry[] arrays; }
 
-        public static string Dir => Path.GetFullPath("Packages/io.github.graydex.vbd/Tests/Fixtures~");
+        public static string Dir => Path.Combine(UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(Fixture).Assembly).resolvedPath, "Tests", "Fixtures~");
 
         readonly Header _header;
         readonly byte[] _data;

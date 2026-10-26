@@ -56,3 +56,11 @@ def color_groups(model):
 
 def fixtures_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "Tests" / "Fixtures~"
+
+
+def group_colors(groups, count):
+    """Per-node color from Newton's color groups (a list of index arrays)."""
+    colors = np.full(count, -1, np.int32)
+    for color, group in enumerate(groups):
+        colors[np.asarray(group, dtype=np.int64)] = color
+    return colors
